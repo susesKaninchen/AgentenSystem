@@ -50,6 +50,11 @@
 - Strukturierte Ergebnisse pro Auftrag als eigenständige Datei ablegen (`data/staging/` für Rohdaten, `outputs/letters/` für Anschreiben).
 - Metadaten (z. B. Bewertung, Quelle, Zeitstempel) in YAML/JSON neben den Texten speichern, damit Versionierung per Git möglich bleibt.
 
+## Identität & Kontext
+- `config/identity.yaml` enthält das aktuelle Profil von Marco Gabrecht und der Maker Faire Lübeck 2026.
+- `tools/identity_loader.py` stellt Hilfsfunktionen bereit (`load_identity`, `get_identity_summary`).
+- Workflows sollen diese Funktionen nutzen, um Anschreiben und Bewertungen zu personalisieren.
+
 ## Umsetzungsschritte / TODOs
 - [x] Projektstruktur festlegen (`agents/`, `tools/`, `workflows/`, `data/`, `config/`).
 - [x] `config/identity.yaml` (oder JSON) definieren: Wer sind wir? Ziele? Schlüsselargumente? Kontaktinfos.
@@ -59,7 +64,9 @@
 - [ ] Guardrails konfigurieren (Output-Filter, maximale Anschreibenlänge, sensible Wörter).
 - [ ] Automatisierte Tests/Smoke-Checks für zentrale Agenten (z. B. Parser, Prompt-Vorlagen).
 - [ ] Deployment-Strategie für Cloud-Umgebung dokumentieren (Container, Secrets-Management, Monitoring).
-- [ ] Recherche-Workflow erweitern (Planner → Recherche → Writer) mit Datei-Ausgaben anlegen.
+- [x] Recherche-Workflow erweitern (Planner → Recherche → Writer) mit Datei-Ausgaben anlegen (`workflows/research_pipeline.py`).
+- [ ] Datenquellen-Anbindung (z. B. Websuche, Scraping) automatisieren, um `data/raw/` zu befüllen.
+- [ ] QA-Agent integrieren, der Anschreiben vor Versand validiert.
 
 ## Offene Fragen
 - Welche konkreten Datenquellen stehen für die Recherche langfristig zur Verfügung (APIs, interne Datenbanken)?

@@ -17,6 +17,13 @@ Mehrstufiges Agenten-Framework, inspiriert vom [OpenAI Agents SDK](https://githu
 7. Verbindung testen: `uv run python workflows/poc.py` ausfuehren. Ergebnis landet in `data/staging/connection_check.txt`.
 8. Identitaetsdatei `config/identity.yaml` als Kontext in Agenten einlesen, um Personalierungen zu ermoeglichen.
 
+## Workflows
+- `workflows/poc.py`: Netzwerkdiagnose, schreibt Ergebnis nach `data/staging/connection_check.txt`.
+- `workflows/research_pipeline.py`: Simulierter Planner → Research → Writer Lauf. Erwartet JSON-Dateien in `data/raw/` (z. B. `robotics_club.json`) und erzeugt:
+  - `data/staging/research_notes.md` (Plan + Bewertung)
+  - `outputs/letters/<slug>.md` (Anschreiben, nutzt `config/identity.yaml`)
+  - Ausfuehrung mit vorhandener `.env`: `uv run --env-file .env python workflows/research_pipeline.py`
+
 ## Arbeitsweise & Qualitätssicherung
 - Zu Beginn jeder Session `git status` prüfen und offene Änderungen mit dem Team abstimmen.
 - Ergebnisse und neue Entscheidungen sofort in `Agents.md` und hier dokumentieren.
