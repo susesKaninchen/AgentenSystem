@@ -15,6 +15,7 @@ Mehrstufiges Agenten-Framework, inspiriert vom [OpenAI Agents SDK](https://githu
 5. Projektstruktur ist bereits vorbereitet (`agents/`, `tools/`, `workflows/`, `config/`, `data/`, `outputs/`); einfach weiter befuellen.
 6. `config/identity.yaml` enthaelt eine Vorlage mit FabLab-Luebeck-Daten – vor dem Versand aktualisieren.
 7. Verbindung testen: `uv run python workflows/poc.py` ausfuehren. Ergebnis landet in `data/staging/connection_check.txt`.
+8. Identitaetsdatei `config/identity.yaml` als Kontext in Agenten einlesen, um Personalierungen zu ermoeglichen.
 
 ## Arbeitsweise & Qualitätssicherung
 - Zu Beginn jeder Session `git status` prüfen und offene Änderungen mit dem Team abstimmen.

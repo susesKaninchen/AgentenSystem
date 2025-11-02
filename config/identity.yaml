@@ -3,39 +3,61 @@
 
 organization:
   name: "FabLab Lübeck e.V."
-  description: "Offene Werkstatt und Makerspace, der Kreative bei Prototyping, Bildung und Innovation unterstützt."
-  location: "Lübeck, Germany"
+  description: >
+    Offene Hightech-Werkstatt (gemeinnütziger Verein) in Lübeck.
+    Unterstützt Maker:innen, Unternehmen und Bildungseinrichtungen beim Basteln, Prototyping und Wissensaustausch.
+  location: "Musikhochschulallee 1, 23552 Lübeck, Deutschland"
   website: "https://fablab-luebeck.de"
 
 representative:
-  name: "Maker Faire Planungsteam"
-  role: "Organisator:innen der Maker Faire Lübeck"
-  email: "info@fablab-luebeck.de"
-  phone: "+49 451 000000"  # Placeholder; ersetzen, falls nötig.
+  name: "Marco Gabrecht"
+  role: "Erster Vorsitzender FabLab Lübeck e.V."
+  responsibilities:
+    - "Leitung der Maker Faire Lübeck 2026 Planung"
+    - "Kontaktaufnahme mit Ausstellenden und Partner:innen"
+    - "Strategische Ausrichtung des Vereins"
+  contact:
+    email: "info@fablab-luebeck.de"
+    phone: ""  # Optional, bei Bedarf ergänzen
 
-outreach_preferences:
-  tone: "freundlich, professionell, einladend"
+event:
+  name: "Maker Faire Lübeck 2026"
+  venue: "Musik- und Kongresshalle Lübeck (MuK)"
+  target_actors: 50
+  positioning: "Gemeinnützige Mitmach-Messe rund ums Basteln, Tüfteln und kreative Technologien."
+  pricing:
+    non_commercial: "Kostenloser Stand (gemeinnützige / nicht-kommerzielle Projekte)."
+    commercial: "Sponsoring- und Partnerpakete in Arbeit."
+  focus_points:
+    - "Basteln, Maker-Kultur, kreative Technikprojekte"
+    - "Community & Wissensaustausch"
+    - "Nachhaltigkeit und Bildung"
+  year: 2026
+
+messaging_guidelines:
+  tone: "Freundlich, wertschätzend, einladend; gern technikaffin."
   key_points:
-    - "Maker Faire Lübeck als Bühne für kreative Projekte"
-    - "Netzwerk mit regionalen Maker:innen, Hochschulen und Unternehmen"
-    - "Unterstützung durch FabLab Lübeck Infrastruktur und Community"
-  call_to_action: "Kurzes Gespräch oder Rückmeldung, ob Interesse an einer Teilnahme besteht."
+    - "Gemeinnütziger Charakter – Fokus auf Mitmachen statt reinen Verkauf."
+    - "Kostenfreie Teilnahme für nicht-kommerzielle Stände."
+    - "Große Bühne in der MuK mit rund 50 Akteur:innen."
+    - "Plattform für Vernetzung von Maker:innen, Startups, Bildung und Öffentlichkeit."
+  call_to_action: "Interesse an einem Stand oder einer Kooperation? Lass uns sprechen!"
 
 audience_fit_criteria:
   ideal_profiles:
-    - "Innovative Maker-Teams mit prototypischen Projekten"
-    - "Startups oder KMUs aus den Bereichen Technik, Nachhaltigkeit, Bildung"
-    - "Bildungs- und Forschungsinitiativen mit Hands-on-Angeboten"
+    - "Maker-Teams mit DIY-/Technikprojekten"
+    - "Gemeinnützige Organisationen oder Bildungseinrichtungen mit Mitmachangeboten"
+    - "Startups/KMU mit innovativen Lösungen, die auch zeigen/basteln"
   exclusion_notes:
-    - "Vermeide Anfragen an Anbieter ohne DIY-/Maker-Bezug."
-    - "Keine reinen Verkaufsstände ohne interaktiven Mehrwert."
+    - "Keine reinen Verkaufsstände ohne Interaktions- oder Mitmachanteil."
+    - "Vermeide Anbieter ohne klaren Bezug zu Maker-Kultur oder Technik."
 
 follow_up:
   reminder_window_days: 7
   preferred_channels:
     - "E-Mail"
-    - "Telefon nur nach ausdrücklicher Zustimmung"
+    - "Telefon nach vorheriger Zustimmung"
 
 compliance:
-  data_retention_policy: "Kontaktdaten nur für die Maker Faire Kommunikation speichern; nach Veranstaltungsende überprüfen."
-  notes: "Bei externen Datenquellen stets Quellenangabe mit URL und Abrufdatum dokumentieren."
+  data_retention_policy: "Kontaktdaten nur für Maker-Faire-Kommunikation verwenden; nach Eventabschluss prüfen und ggf. löschen."
+  notes: "Immer Quelle, Abrufdatum und Einwilligungen dokumentieren."
