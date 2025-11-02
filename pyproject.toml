@@ -5,6 +5,7 @@ description = "Mehrstufiges Agenten-Framework fuer Recherche und Outreach."
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
+    "openai>=1.40.0,<2.0.0",
     "openai-agents>=0.2.0",
 ]
 

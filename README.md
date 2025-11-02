@@ -14,7 +14,7 @@ Mehrstufiges Agenten-Framework, inspiriert vom [OpenAI Agents SDK](https://githu
 4. Lege eine `.env`/`.env.local` an (siehe `.env.example`) und trage dort deine geheimen Verbindungsdaten (`OPENAI_API_KEY`, `OPENAI_BASE_URL`, `OPENAI_MODEL`) ein – niemals direkt committen.
 5. Projektstruktur ist bereits vorbereitet (`agents/`, `tools/`, `workflows/`, `config/`, `data/`, `outputs/`); einfach weiter befuellen.
 6. `config/identity.yaml` enthaelt eine Vorlage mit FabLab-Luebeck-Daten – vor dem Versand aktualisieren.
-7. Erstes Experiment: Minimalen Agenten mit `Runner.run_sync` aus dem SDK starten und lokale Tools anbinden.
+7. Verbindung testen: `uv run python workflows/poc.py` ausfuehren. Ergebnis landet in `data/staging/connection_check.txt`.
 
 ## Arbeitsweise & Qualitätssicherung
 - Zu Beginn jeder Session `git status` prüfen und offene Änderungen mit dem Team abstimmen.

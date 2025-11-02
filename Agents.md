@@ -45,15 +45,21 @@
 - Rate Limits/Quota der verwendeten LLMs beachten → Backoff/Retries planen und Monitoring einführen.
 - Datenschutz: Kontakte dürfen nur mit Einwilligung gespeichert/verarbeitet werden → Aufbewahrungsregeln definieren.
 
+## Datenhaltung
+- Primärer Speicher sind Textdateien/Markdown/JSON in `data/` und `outputs/`; keine Datenbanken im Standardbetrieb.
+- Strukturierte Ergebnisse pro Auftrag als eigenständige Datei ablegen (`data/staging/` für Rohdaten, `outputs/letters/` für Anschreiben).
+- Metadaten (z. B. Bewertung, Quelle, Zeitstempel) in YAML/JSON neben den Texten speichern, damit Versionierung per Git möglich bleibt.
+
 ## Umsetzungsschritte / TODOs
 - [x] Projektstruktur festlegen (`agents/`, `tools/`, `workflows/`, `data/`, `config/`).
 - [x] `config/identity.yaml` (oder JSON) definieren: Wer sind wir? Ziele? Schlüsselargumente? Kontaktinfos.
 - [x] Basiskonfiguration für OpenAI Agents SDK erstellen (`pyproject.toml`, virtuelle Umgebung via uv vorbereiten).
-- [ ] Proof-of-Concept: Einfache Pipeline (Planner → Recherche → Writer) mit Platzhalter-Tools implementieren.
+- [x] Proof-of-Concept: Einfache Pipeline (Diagnostics-Agent über `workflows/poc.py`) implementieren und Verbindung testen.
 - [ ] Datenpersistenz entwerfen (Dateisystem, SQLite, ggf. Redis Sessions) und Logging-Format festlegen.
 - [ ] Guardrails konfigurieren (Output-Filter, maximale Anschreibenlänge, sensible Wörter).
 - [ ] Automatisierte Tests/Smoke-Checks für zentrale Agenten (z. B. Parser, Prompt-Vorlagen).
 - [ ] Deployment-Strategie für Cloud-Umgebung dokumentieren (Container, Secrets-Management, Monitoring).
+- [ ] Recherche-Workflow erweitern (Planner → Recherche → Writer) mit Datei-Ausgaben anlegen.
 
 ## Offene Fragen
 - Welche konkreten Datenquellen stehen für die Recherche langfristig zur Verfügung (APIs, interne Datenbanken)?
