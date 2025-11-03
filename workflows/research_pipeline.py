@@ -107,6 +107,7 @@ def build_model() -> OpenAIChatCompletionsModel:
     api_key = os.environ["OPENAI_API_KEY"]
     os.environ.setdefault("OPENAI_DEFAULT_MODEL", model_name)
     client = AsyncOpenAI(base_url=base_url, api_key=api_key)
+    print(f"Verwende Endpoint: {client.base_url}")
     return OpenAIChatCompletionsModel(model=model_name, openai_client=client)
 
 
