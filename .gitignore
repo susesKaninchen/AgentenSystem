@@ -205,3 +205,8 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# Agent runtime artifacts
+data/staging/enrichment/
+data/staging/search/
+data/staging/candidates_selected.json

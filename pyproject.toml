@@ -8,6 +8,8 @@ dependencies = [
     "openai>=1.40.0,<2.0.0",
     "openai-agents>=0.2.0",
     "pyyaml>=6.0.3",
+    "duckduckgo-search>=6.1.0,<7.0.0",
+    "lxml>=4.9.0,<6.0.0",
 ]
 
 [build-system]

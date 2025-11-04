@@ -27,12 +27,16 @@
 - Eigene Sammlungen:
   - `docs/use-cases/` (geplante Vertiefungen, z. B. Maker Faire Recherche).
   - Datenspeicher für gecrawlte Ergebnisse (z. B. `data/staging/`) und persistierte Anschreiben (`outputs/letters/`).
+- NorthData (https://www.northdata.de) für Firmenhintergründe via Suggest-API, Ergebnisse werden automatisch unter `data/staging/enrichment/` abgelegt.
+- DuckDuckGo-Suche (`tools/duckduckgo.py`) als primäre Web-Recherchequelle; Query- und Ergebnis-Logs liegen in `data/staging/search/`.
+- OpenAI-Beispiel *research_bot* demonstriert bewährte Muster: Planner mit Pydantic-Ausgabe, asynchroner Such-Manager (`Runner.run` in Tasks) und Tool-basierte Websuche (`WebSearchTool`). Diese Konzepte übernehmen wir für planbare, streaming-fähige Feedback-Loops.
 - Externe Recherchequellen: öffentliche Webseiten, Verzeichnisse zu Maker-/FabLab-Ausstellern, Social Media Profile. Agenten sollten Quellen jeweils protokollieren (URL + Datum).
 
 ## Geplante Agentenrollen
 - **Planner/Triage-Agent**: Nimmt Nutzeranfragen entgegen, bricht sie in Recherche-Tasks herunter und erstellt Suchaufträge.
-- **Recherche-Agenten**: Führen gezielte Web-/Dokumentrecherche zu Teilaspekten durch (z. B. lokale Firmen, Maker-Szene, Sponsoren).
+- **Recherche-Agenten** / **Search-Orchestrator**: Führen gezielte DuckDuckGo-Recherchen durch, persistieren Treffer und reichen sie an Evaluator:innen weiter.
 - **Evaluator-Agenten**: Prüfen Treffer auf Relevanz, verwerfen ungeeignete Ergebnisse und priorisieren vielversprechende Kandidaten.
+- **Query-Refiner**: Analysiert Evaluator-Feedback und generiert neue Suchqueries, bis Zielanzahl erreicht oder Suchraum ausgeschöpft ist.
 - **Crawler/Extractor**: Extrahieren Kerninformationen aus Webseiten/Dokumenten (Kontakt, Projekte, USP, Anforderungen).
 - **Personalisierungs-Agent**: Kombiniert extrahierte Daten mit Identitätsdatei, erstellt strukturierte Profile.
 - **Writer-Agent**: Generiert personalisierte Anschreiben und legt sie als Dateien ab (inkl. Quellenverweis).
@@ -48,6 +52,8 @@
 ## Datenhaltung
 - Primärer Speicher sind Textdateien/Markdown/JSON in `data/` und `outputs/`; keine Datenbanken im Standardbetrieb.
 - Strukturierte Ergebnisse pro Auftrag als eigenständige Datei ablegen (`data/staging/` für Rohdaten, `outputs/letters/` für Anschreiben).
+- Externe Anreicherungen (z. B. NorthData) separat versionierbar speichern (`data/staging/enrichment/`).
+- Suchtreffer und Evaluations-Snapshots versionierbar halten (`data/staging/search/`, `data/staging/candidates_selected.json`), um Feedback-Loops nachvollziehen zu können.
 - Metadaten (z. B. Bewertung, Quelle, Zeitstempel) in YAML/JSON neben den Texten speichern, damit Versionierung per Git möglich bleibt.
 
 ## Identität & Kontext
@@ -65,7 +71,8 @@
 - [ ] Automatisierte Tests/Smoke-Checks für zentrale Agenten (z. B. Parser, Prompt-Vorlagen).
 - [ ] Deployment-Strategie für Cloud-Umgebung dokumentieren (Container, Secrets-Management, Monitoring).
 - [x] Recherche-Workflow erweitern (Planner → Recherche → Writer) mit Datei-Ausgaben anlegen (`workflows/research_pipeline.py`).
-- [ ] Datenquellen-Anbindung (z. B. Websuche, Scraping) automatisieren, um `data/raw/` zu befüllen.
+- [x] Datenquellen-Anbindung (DuckDuckGo-Suche + NorthData-Enrichment) automatisieren, inklusive Feedback-Schleifen und Persistenz.
+- [ ] Offizielles Tooling aus dem OpenAI *research_bot* nachbilden (Pydantic-Planner, Tool-Aufrufe per `Runner.run` in async-Tasks, Trace-Integration).
 - [ ] QA-Agent integrieren, der Anschreiben vor Versand validiert.
 
 ## Offene Fragen

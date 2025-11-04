@@ -50,7 +50,7 @@ def ensure_required_env(vars_: Iterable[str]) -> None:
 def run_diagnostics() -> str:
     model_name = os.environ["OPENAI_MODEL"]
     base_url = os.environ["OPENAI_BASE_URL"]
-    api_key = os.environ["OPENAI_API_KEY"]
+    api_key = os.environ.get("OPENAI_API_KEY", "")
 
     os.environ.setdefault("OPENAI_DEFAULT_MODEL", model_name)
 
@@ -85,7 +85,7 @@ def store_result(content: str) -> None:
 
 def main() -> None:
     load_env_file(ENV_PATH)
-    ensure_required_env(["OPENAI_API_KEY", "OPENAI_BASE_URL", "OPENAI_MODEL"])
+    ensure_required_env(["OPENAI_BASE_URL", "OPENAI_MODEL"])
 
     print("Starte Verbindungsdiagnose...")
     print("Erforderliche Umgebungsvariablen gefunden.")
