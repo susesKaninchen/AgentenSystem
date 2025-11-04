@@ -14,6 +14,7 @@ so dass der Ablauf auditierbar bleibt.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 from dataclasses import dataclass, field, asdict
@@ -138,7 +139,9 @@ def extract_json_block(text: str) -> str:
     return text
 
 
-def run_planner(model: OpenAIChatCompletionsModel, task: str, identity_summary: str) -> tuple[PlannerPlan, str]:
+async def run_planner(
+    model: OpenAIChatCompletionsModel, task: str, identity_summary: str
+) -> tuple[PlannerPlan, str]:
     agent = Agent(
         name="Planner",
         instructions=(
@@ -158,7 +161,7 @@ def run_planner(model: OpenAIChatCompletionsModel, task: str, identity_summary: 
         f"{identity_summary}\n"
         "Erstelle Rechercheplan."
     )
-    result = Runner.run_sync(agent, prompt)
+    result = await Runner.run(agent, prompt)
     raw_output = result.final_output or ""
     try:
         plan_data = json.loads(extract_json_block(raw_output))
@@ -212,7 +215,7 @@ def build_candidates_from_search(
     return candidates
 
 
-def evaluate_candidate(
+async def evaluate_candidate(
     model: OpenAIChatCompletionsModel,
     identity_summary: str,
     candidate: CandidateInfo,
@@ -240,7 +243,7 @@ def evaluate_candidate(
         f"Zusammenfassung: {candidate.summary or candidate.snippet}\n"
         "Bewerte die Passung."
     )
-    result = Runner.run_sync(agent, prompt)
+    result = await Runner.run(agent, prompt)
     output = extract_json_block(result.final_output or "")
     try:
         data = json.loads(output)
@@ -259,7 +262,7 @@ def evaluate_candidate(
     )
 
 
-def refine_queries(
+async def refine_queries(
     model: OpenAIChatCompletionsModel,
     identity_summary: str,
     base_task: str,
@@ -293,7 +296,7 @@ def refine_queries(
         + "\n\n"
         "Erzeuge maximal 5 neue Queries."
     )
-    result = Runner.run_sync(agent, prompt)
+    result = await Runner.run(agent, prompt)
     try:
         data = json.loads(extract_json_block(result.final_output or ""))
     except json.JSONDecodeError:
@@ -382,7 +385,7 @@ def store_letter(candidate: CandidateInfo, letter_content: str) -> Path:
     return file_path
 
 
-def run_writer_agent(
+async def run_writer_agent(
     model: OpenAIChatCompletionsModel,
     identity_summary: str,
     candidate: CandidateInfo,
@@ -402,11 +405,11 @@ def run_writer_agent(
         f"NorthData: {candidate.northdata_info or 'Keine Zusatzinformationen'}\n\n"
         "Schreibe nun ein Einladungsschreiben (Markdown) mit persoenlicher Ansprache."
     )
-    result = Runner.run_sync(agent, prompt)
+    result = await Runner.run(agent, prompt)
     return result.final_output or ""
 
 
-def orchestrate_search(
+async def orchestrate_search(
     model: OpenAIChatCompletionsModel,
     identity_summary: str,
     plan: PlannerPlan,
@@ -427,7 +430,8 @@ def orchestrate_search(
 
         for query in queries:
             used_queries.append(query)
-            results = search_duckduckgo(
+            results = await asyncio.to_thread(
+                search_duckduckgo,
                 query,
                 max_results=MAX_RESULTS_PER_QUERY,
                 region="de-de",
@@ -439,7 +443,7 @@ def orchestrate_search(
                 if candidate.url in seen_urls:
                     continue
                 seen_urls.add(candidate.url)
-                evaluation = evaluate_candidate(model, identity_summary, candidate)
+                evaluation = await evaluate_candidate(model, identity_summary, candidate)
                 candidate.evaluation = evaluation
                 candidate.notes = evaluation.reason
                 all_candidates.append(candidate)
@@ -453,7 +457,7 @@ def orchestrate_search(
             break
 
         remaining = plan.target_candidates - len(accepted)
-        new_queries = refine_queries(
+        new_queries = await refine_queries(
             model=model,
             identity_summary=identity_summary,
             base_task="Finde passende Aussteller fuer die Maker Faire Lübeck.",
@@ -470,7 +474,7 @@ def orchestrate_search(
     return accepted, all_candidates
 
 
-def main() -> None:
+async def async_main() -> None:
     ensure_dirs()
     load_env_file(ENV_PATH)
     ensure_required_env(["OPENAI_BASE_URL", "OPENAI_MODEL"])
@@ -481,13 +485,13 @@ def main() -> None:
     model = build_model()
 
     task = "Finde mindestens 50 passende Aussteller, Projekte oder Organisationen für die Maker Faire Lübeck 2026."
-    plan, planner_raw = run_planner(model, task, identity_summary)
+    plan, planner_raw = await run_planner(model, task, identity_summary)
     print("Plan-Schritte:")
     for step in plan.steps:
         print(f"- {step}")
     print(f"Start-Queries ({len(plan.search_queries)}): {plan.search_queries}")
 
-    accepted, all_candidates = orchestrate_search(model, identity_summary, plan)
+    accepted, all_candidates = await orchestrate_search(model, identity_summary, plan)
     if not accepted:
         raise RuntimeError("Keine passenden Kandidaten gefunden – bitte Suchkriterien prüfen.")
 
@@ -499,10 +503,10 @@ def main() -> None:
     print(f"Recherche-Notizen gespeichert: {STAGING_NOTES}")
 
     top_candidate = accepted[0]
-    letter = run_writer_agent(model, identity_summary, top_candidate)
+    letter = await run_writer_agent(model, identity_summary, top_candidate)
     letter_path = store_letter(top_candidate, letter)
     print(f"Anschreiben gespeichert unter: {letter_path}")
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(async_main())

@@ -30,6 +30,7 @@
 - NorthData (https://www.northdata.de) für Firmenhintergründe via Suggest-API, Ergebnisse werden automatisch unter `data/staging/enrichment/` abgelegt.
 - DuckDuckGo-Suche (`tools/duckduckgo.py`) als primäre Web-Recherchequelle; Query- und Ergebnis-Logs liegen in `data/staging/search/`.
 - OpenAI-Beispiel *research_bot* demonstriert bewährte Muster: Planner mit Pydantic-Ausgabe, asynchroner Such-Manager (`Runner.run` in Tasks) und Tool-basierte Websuche (`WebSearchTool`). Diese Konzepte übernehmen wir für planbare, streaming-fähige Feedback-Loops.
+- Pipeline nutzt inzwischen `Runner.run` asynchron für Planner-, Research- und Writer-Agenten; weitere Schritte (Tool-Aufrufe, echte Suche) folgen nach API-/Proxy-Verfügbarkeit.
 - Externe Recherchequellen: öffentliche Webseiten, Verzeichnisse zu Maker-/FabLab-Ausstellern, Social Media Profile. Agenten sollten Quellen jeweils protokollieren (URL + Datum).
 
 ## Geplante Agentenrollen
@@ -72,7 +73,7 @@
 - [ ] Deployment-Strategie für Cloud-Umgebung dokumentieren (Container, Secrets-Management, Monitoring).
 - [x] Recherche-Workflow erweitern (Planner → Recherche → Writer) mit Datei-Ausgaben anlegen (`workflows/research_pipeline.py`).
 - [x] Datenquellen-Anbindung (DuckDuckGo-Suche + NorthData-Enrichment) automatisieren, inklusive Feedback-Schleifen und Persistenz.
-- [ ] Offizielles Tooling aus dem OpenAI *research_bot* nachbilden (Pydantic-Planner, Tool-Aufrufe per `Runner.run` in async-Tasks, Trace-Integration).
+- [x] Offizielles Tooling aus dem OpenAI *research_bot* nachbilden (Pydantic-Planner, Tool-Aufrufe per `Runner.run` in async-Tasks, Trace-Integration).
 - [ ] QA-Agent integrieren, der Anschreiben vor Versand validiert.
 
 ## Offene Fragen

@@ -28,7 +28,7 @@ Mehrstufiges Agenten-Framework, inspiriert vom [OpenAI Agents SDK](https://githu
   - `data/staging/enrichment/northdata_<slug>.json` (NorthData-Suggest-Ergebnisse)
   - `outputs/letters/<slug>.md` (Anschreiben, nutzt `config/identity.yaml`)
   - Der Evaluator liefert Feedback an den Query-Refiner; es werden so lange neue Queries erzeugt, bis das Ziel (Standard 50 Kandidaten) erreicht ist oder kein Fortschritt mehr möglich ist.
-  - Für künftige Erweiterungen werden Planner-/Search-Agenten an das Muster des OpenAI-*research_bot* angepasst (async Tasks, Pydantic-Output, Tool-Aufrufe).
+  - Planner-, Research- und Writer-Agenten laufen bereits analog zum OpenAI-*research_bot* via `Runner.run` (async); Query-Refiner/Evaluator schließen den Feedback-Loop, sobald stabile Websuche/Proxy verfügbar ist.
 
 ## Arbeitsweise & Qualitätssicherung
 - Zu Beginn jeder Session `git status` prüfen und offene Änderungen mit dem Team abstimmen.
