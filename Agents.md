@@ -3,7 +3,8 @@
 ## Vision
 - Aufbau eines mehrstufigen Recherche- und Kontakt-Agentensystems, das automatische Informationsgewinnung, Bewertung und personalisierte Anschreiben ermöglicht (z. B. für Maker Faire Lübeck).
 - Nutzung des [OpenAI Agents SDK](https://github.com/openai/openai-agents-python) als Grundlage für Agenten, Handoffs, Guardrails und Sessions.
-- Fokus auf reproduzierbaren Deployments in unserer Cloud-Umgebung mit klarer Dokumentation und nachvollziehbaren Entscheidungen.
+- Fokus auf reproduzierbaren lokalen Deployments (Cloud-Anbindung optional) mit klarer Dokumentation und nachvollziehbaren Entscheidungen.
+- Zielgruppe: nicht-kommerzielle Maker:innen, Hackspaces, offene Werkstätten und Kultur-/Bildungskollektive (Chaotikum, Fuchsbau, freie Labore) aus Norddeutschland.
 
 ## Betriebsregeln
 - `git status` beim Start jedes Arbeitssprints prüfen; bei offenen Änderungen kurz zusammenfassen und Freigabe einholen.
@@ -18,8 +19,11 @@
   - `OPENAI_API_KEY`
   - `OPENAI_BASE_URL`
   - `OPENAI_MODEL`
+  - `GOOGLE_API_KEY` (optional – ohne fällt die Suche auf DuckDuckGo zurück)
+  - `GOOGLE_SEARCH_ENGINE_ID` (optional – benötigt für Google Custom Search)
 - Bei lokalen Tests `dotenv` laden oder Environment im Deployment konfigurieren.
 - Beispielkonfiguration liegt in `.env.example` (nur Platzhalter, keine echten Werte).
+- `ENABLE_WEB_SEARCH_TOOL=0/1` steuert, ob das OpenAI-WebSearchTool genutzt wird. Bei `0` laufen wir direkt über DuckDuckGo/Seeds.
 
 ## Wissensquellen & Referenzen
 - OpenAI Agents SDK Dokumentation: Kernkonzepte wie `Agent`, `Runner`, `handoffs`, `guardrails`, `sessions`.
@@ -28,20 +32,21 @@
   - `docs/use-cases/` (geplante Vertiefungen, z. B. Maker Faire Recherche).
   - Datenspeicher für gecrawlte Ergebnisse (z. B. `data/staging/`) und persistierte Anschreiben (`outputs/letters/`).
 - NorthData (https://www.northdata.de) für Firmenhintergründe via Suggest-API, Ergebnisse werden automatisch unter `data/staging/enrichment/` abgelegt.
-- DuckDuckGo-Suche (`tools/duckduckgo.py`) als primäre Web-Recherchequelle; Query- und Ergebnis-Logs liegen in `data/staging/search/`.
+- WebSearchTool (OpenAI Responses API) ist der Standard für Recherche; wenn das nicht verfügbar ist, fällt das System auf Google/DuckDuckGo (`tools/google_search.py` / `tools/duckduckgo.py`) und eine Seed-Liste (Chaotikum, Fuchsbau, Freies Labor, Hackerspace Bremen, Chaostreff Flensburg) zurück. Query- und Ergebnis-Logs liegen in `data/staging/search/`.
+- Bei wiederholten Rate-Limits zieht der Workflow lokale Seed-Kandidaten (Chaotikum, Fuchsbau, Freies Labor, Hackerspace Bremen, Chaostreff Flensburg) heran, damit Evaluator:innen und Writer weiterarbeiten können.
 - OpenAI-Beispiel *research_bot* demonstriert bewährte Muster: Planner mit Pydantic-Ausgabe, asynchroner Such-Manager (`Runner.run` in Tasks) und Tool-basierte Websuche (`WebSearchTool`). Diese Konzepte übernehmen wir für planbare, streaming-fähige Feedback-Loops.
 - Pipeline nutzt inzwischen `Runner.run` asynchron für Planner-, Research- und Writer-Agenten; weitere Schritte (Tool-Aufrufe, echte Suche) folgen nach API-/Proxy-Verfügbarkeit.
 - Externe Recherchequellen: öffentliche Webseiten, Verzeichnisse zu Maker-/FabLab-Ausstellern, Social Media Profile. Agenten sollten Quellen jeweils protokollieren (URL + Datum).
 
 ## Geplante Agentenrollen
 - **Planner/Triage-Agent**: Nimmt Nutzeranfragen entgegen, bricht sie in Recherche-Tasks herunter und erstellt Suchaufträge.
-- **Recherche-Agenten** / **Search-Orchestrator**: Führen gezielte DuckDuckGo-Recherchen durch, persistieren Treffer und reichen sie an Evaluator:innen weiter.
+- **Recherche-Agenten** / **Search-Orchestrator**: Fokussieren Suchqueries auf non-kommerzielle Kollektive (Chaotikum, Fuchsbau, offene Werkstätten) und führen Google- bzw. DuckDuckGo-Recherchen durch, persistieren Treffer und reichen sie an Evaluator:innen weiter.
 - **Evaluator-Agenten**: Prüfen Treffer auf Relevanz, verwerfen ungeeignete Ergebnisse und priorisieren vielversprechende Kandidaten.
 - **Query-Refiner**: Analysiert Evaluator-Feedback und generiert neue Suchqueries, bis Zielanzahl erreicht oder Suchraum ausgeschöpft ist.
 - **Crawler/Extractor**: Extrahieren Kerninformationen aus Webseiten/Dokumenten (Kontakt, Projekte, USP, Anforderungen).
 - **Personalisierungs-Agent**: Kombiniert extrahierte Daten mit Identitätsdatei, erstellt strukturierte Profile.
-- **Writer-Agent**: Generiert personalisierte Anschreiben und legt sie als Dateien ab (inkl. Quellenverweis).
-- **QA/Guardrail-Agent**: Prüft Anschreiben auf Tonalität, Faktenkonsistenz und Datenschutzvorgaben, bevor sie freigegeben werden.
+- **Writer-Agent**: Generiert personalisierte Anschreiben, betont kostenlosen Stand für gemeinnützige/nicht-kommerzielle Teams und legt die Dateien (inkl. Quellenverweis) ab.
+- **QA/Guardrail-Agent** (aktiv in `workflows/research_pipeline.py`): Erzwingt DIN-A4-konforme Länge, keine Versprechen/Garantien und protokolliert Freigaben.
 
 ## Risiken & Stolperfallen
 - Fehlende Guardrails können zu falschen oder unsicheren Anschreiben führen → Validierung verpflichtend.
@@ -56,6 +61,7 @@
 - Externe Anreicherungen (z. B. NorthData) separat versionierbar speichern (`data/staging/enrichment/`).
 - Suchtreffer und Evaluations-Snapshots versionierbar halten (`data/staging/search/`, `data/staging/candidates_selected.json`), um Feedback-Loops nachvollziehen zu können.
 - Metadaten (z. B. Bewertung, Quelle, Zeitstempel) in YAML/JSON neben den Texten speichern, damit Versionierung per Git möglich bleibt.
+- Details zu Ablageformaten, QA-Metadaten und Logging stehen in `docs/data_persistence.md`. Pipelinelogs landen in `logs/pipeline.log` (JSON pro Event).
 
 ## Identität & Kontext
 - `config/identity.yaml` enthält das aktuelle Profil von Marco Gabrecht und der Maker Faire Lübeck 2026.
@@ -67,14 +73,13 @@
 - [x] `config/identity.yaml` (oder JSON) definieren: Wer sind wir? Ziele? Schlüsselargumente? Kontaktinfos.
 - [x] Basiskonfiguration für OpenAI Agents SDK erstellen (`pyproject.toml`, virtuelle Umgebung via uv vorbereiten).
 - [x] Proof-of-Concept: Einfache Pipeline (Diagnostics-Agent über `workflows/poc.py`) implementieren und Verbindung testen.
-- [ ] Datenpersistenz entwerfen (Dateisystem, SQLite, ggf. Redis Sessions) und Logging-Format festlegen.
-- [ ] Guardrails konfigurieren (Output-Filter, maximale Anschreibenlänge, sensible Wörter).
-- [ ] Automatisierte Tests/Smoke-Checks für zentrale Agenten (z. B. Parser, Prompt-Vorlagen).
-- [ ] Deployment-Strategie für Cloud-Umgebung dokumentieren (Container, Secrets-Management, Monitoring).
+- [x] Datenpersistenz (Dateisystem) und Logging-Format definieren (`docs/data_persistence.md`, `logs/pipeline.log`).
+- [x] Guardrails konfigurieren (DIN-A4-Limit, keine Versprechen, QA-Freigabe).
+- [ ] Automatisierte Tests/Smoke-Checks für zentrale Agenten (zurzeit zurückgestellt, sobald stabiler Workflow benötigt wird).
 - [x] Recherche-Workflow erweitern (Planner → Recherche → Writer) mit Datei-Ausgaben anlegen (`workflows/research_pipeline.py`).
-- [x] Datenquellen-Anbindung (DuckDuckGo-Suche + NorthData-Enrichment) automatisieren, inklusive Feedback-Schleifen und Persistenz.
+- [x] Datenquellen-Anbindung (Google Custom Search + NorthData-Enrichment) automatisieren, inklusive Feedback-Schleifen und Persistenz.
 - [x] Offizielles Tooling aus dem OpenAI *research_bot* nachbilden (Pydantic-Planner, Tool-Aufrufe per `Runner.run` in async-Tasks, Trace-Integration).
-- [ ] QA-Agent integrieren, der Anschreiben vor Versand validiert.
+- [x] QA-Agent integrieren, der Anschreiben vor Versand validiert.
 
 ## Offene Fragen
 - Welche konkreten Datenquellen stehen für die Recherche langfristig zur Verfügung (APIs, interne Datenbanken)?

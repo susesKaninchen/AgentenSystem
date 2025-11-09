@@ -91,15 +91,27 @@ def fetch_suggestions(
 
 
 def slugify(value: str) -> str:
-    return (
+    sanitized = (
         value.lower()
         .replace(" ", "-")
         .replace("/", "-")
+        .replace("\\", "-")
         .replace(".", "-")
         .replace("_", "-")
         .replace(",", "-")
-        .strip("-")
+        .replace('"', "")
+        .replace("'", "")
+        .replace(":", "-")
+        .replace(";", "-")
+        .replace("|", "-")
+        .replace("?", "-")
+        .replace("*", "-")
+        .replace("<", "-")
+        .replace(">", "-")
     )
+    while "--" in sanitized:
+        sanitized = sanitized.replace("--", "-")
+    return sanitized.strip("-")
 
 
 def store_suggestions(
