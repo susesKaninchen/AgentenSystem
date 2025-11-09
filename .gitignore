@@ -210,3 +210,5 @@ __marimo__/
 data/staging/enrichment/
 data/staging/search/
 data/staging/candidates_selected.json
+data/staging/organizations_registry.json
+data/staging/snapshots/

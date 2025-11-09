@@ -33,6 +33,8 @@ from agents.tracing import set_tracing_disabled
 from openai import AsyncOpenAI
 
 from tools.identity_loader import get_identity_summary, load_identity
+from tools.blacklist import BlacklistManager
+from tools.org_registry import OrganizationRegistry
 from tools.directory_parser import DirectoryEntry, DirectoryParserError, expand_directory
 from tools.google_search import (
     GoogleSearchResult,
@@ -53,7 +55,7 @@ from tools.northdata import (
     format_top_suggestion,
     store_suggestions,
 )
-from tools.site_scraper import SiteSnapshot, fetch_site_snapshot
+from tools.site_scraper import SiteSnapshot, fetch_site_snapshot, fetch_related_snapshots
 from tools.web_search_agent import run_web_search_agent
 
 
@@ -309,6 +311,12 @@ def parse_args() -> argparse.Namespace:
         default=os.environ.get("MAX_LETTERS_PER_RUN"),
         help="Übersteuert Zahl der Anschreiben pro Lauf.",
     )
+    parser.add_argument(
+        "--resume-candidates",
+        nargs="?",
+        const=str(STAGING_ACCEPTED),
+        help="Überspringt die Websuche und lädt akzeptierte Kandidaten aus der angegebenen Snapshot-Datei (Standard: data/staging/candidates_selected.json).",
+    )
     return parser.parse_args()
 
 
@@ -391,6 +399,16 @@ class EvaluationResult:
 
 
 @dataclass
+class CoordinatorDecision:
+    approved: bool
+    reason: str
+    dialogue: List[str] = field(default_factory=list)
+    keyword_hints: List[str] = field(default_factory=list)
+    blacklist: bool = False
+    blacklist_reason: str = ""
+
+
+@dataclass
 class CandidateInfo:
     name: str
     url: str
@@ -400,6 +418,10 @@ class CandidateInfo:
     notes: str = ""
     northdata_info: str = ""
     evaluation: Optional[EvaluationResult] = field(default=None, repr=False)
+    coordination: Optional[CoordinatorDecision] = field(default=None, repr=False)
+    context: Optional["CandidateContext"] = field(default=None, repr=False)
+    org_slug: str = ""
+    duplicate_reason: str = ""
 
     def as_markdown(self) -> str:
         base = (
@@ -433,11 +455,43 @@ def looks_like_directory_candidate(candidate: CandidateInfo) -> bool:
     return any(keyword in text for keyword in DIRECTORY_HINT_KEYWORDS)
 
 
+def domain_key(url: str) -> str:
+    host = urlparse(url).netloc.lower()
+    if host.startswith("www."):
+        host = host[4:]
+    if ":" in host:
+        host = host.split(":", 1)[0]
+    return host
+
+
+def default_org_slug(candidate: CandidateInfo) -> str:
+    domain = domain_key(candidate.url)
+    parsed = urlparse(candidate.url)
+    parts = [part for part in parsed.path.split("/") if part]
+    generic_prefixes = {"event", "events", "tag", "tags", "blog", "category", "projekt", "project"}
+    key = ""
+    if parts:
+        primary = parts[0]
+        if primary not in generic_prefixes and not primary.isdigit():
+            key = primary
+    if not key:
+        name_base = "".join(ch for ch in (candidate.name or "") if not ch.isdigit()).strip() or domain
+        key = "-".join(name_base.split()[:4])
+    base = f"{domain}-{key}"
+    return slugify(base)
+
+
 @dataclass
 class QAResult:
     approved: bool
     letter: str
     notes: str
+
+
+@dataclass
+class CandidateContext:
+    primary: Optional[SiteSnapshot]
+    related: List[SiteSnapshot] = field(default_factory=list)
 
 
 class SearchResult(Protocol):
@@ -631,6 +685,58 @@ def build_candidates_from_search(
     return candidates
 
 
+async def filter_search_results(
+    model: OpenAIChatCompletionsModel,
+    identity_summary: str,
+    query: str,
+    results: Sequence[SearchResult],
+) -> Sequence[SearchResult]:
+    if len(results) <= 3:
+        return results
+    agent = Agent(
+        name="ResultFilter",
+        instructions=(
+            "Du bist ein Recherche-Koordinator. Entferne Duplikate (gleiche Domains), "
+            "rein kommerzielle Shops und reine Verzeichnis-/Newsseiten. "
+            "Behalte höchstens 6 Ergebnisse pro Query und markiere ggf. interessante Unterseiten "
+            "(z. B. /kontakt, /about). "
+            "Antwort nur als JSON: "
+            '{"keep_indexes": [0,2,...], "notes": "..."}'
+        ),
+        model=model,
+    )
+    serialized = [
+        {
+            "index": idx,
+            "title": item.title,
+            "url": item.url,
+            "snippet": item.snippet,
+        }
+        for idx, item in enumerate(results)
+    ]
+    prompt = (
+        f"Identität:\n{identity_summary}\n\n"
+        f"Query: {query}\n"
+        "Suchergebnisse:\n"
+        + json.dumps(serialized, ensure_ascii=False, indent=2)
+        + "\n\nWähle die relevantesten Einträge."
+    )
+    result = await Runner.run(agent, prompt)
+    try:
+        data = json.loads(extract_json_block(result.final_output or ""))
+        keep = [
+            int(idx)
+            for idx in data.get("keep_indexes", [])
+            if isinstance(idx, int)
+        ]
+    except (json.JSONDecodeError, ValueError, TypeError):
+        keep = []
+    keep = [idx for idx in keep if 0 <= idx < len(results)]
+    if not keep:
+        return results[:6]
+    return [results[idx] for idx in keep]
+
+
 def build_seed_candidates() -> List[CandidateInfo]:
     candidates: List[CandidateInfo] = []
     for seed in FALLBACK_SEED_CANDIDATES:
@@ -695,6 +801,37 @@ def select_letter_candidates(
     return chosen
 
 
+def load_candidates_from_snapshot(path: Path) -> List[CandidateInfo]:
+    if not path.exists():
+        raise FileNotFoundError(f"Snapshot {path} nicht gefunden.")
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    entries = payload.get("accepted") or []
+    candidates: List[CandidateInfo] = []
+    for entry in entries:
+        evaluation_data = entry.get("evaluation") or {}
+        evaluation = None
+        if evaluation_data:
+            evaluation = EvaluationResult(
+                score=float(evaluation_data.get("score", 0.0)),
+                accepted=bool(evaluation_data.get("accepted", False)),
+                reason=str(evaluation_data.get("reason", "")),
+                search_adjustment=str(evaluation_data.get("search_adjustment", "")),
+            )
+        candidate = CandidateInfo(
+            name=entry.get("name", ""),
+            url=entry.get("url", ""),
+            summary=entry.get("summary", ""),
+            source_query=entry.get("source_query", "resume"),
+            snippet=entry.get("snippet", ""),
+            notes=entry.get("notes", ""),
+            northdata_info=entry.get("northdata_info", ""),
+            org_slug=entry.get("org_slug", ""),
+        )
+        candidate.evaluation = evaluation
+        candidates.append(candidate)
+    return candidates
+
+
 def extend_plan_with_region(plan: PlannerPlan, region: str) -> None:
     region_queries = REGIONAL_QUERY_SETS.get(region.lower())
     if not region_queries:
@@ -710,6 +847,7 @@ async def evaluate_candidate(
     model: OpenAIChatCompletionsModel,
     identity_summary: str,
     candidate: CandidateInfo,
+    context: Optional[CandidateContext],
 ) -> EvaluationResult:
     console(f"Bewerte Kandidat: {candidate.name} ({candidate.url}) ...")
     agent = Agent(
@@ -728,6 +866,7 @@ async def evaluate_candidate(
         ),
         model=model,
     )
+    context_block = format_context_for_prompt(context)
     prompt = (
         "Identität des Auftraggebers:\n"
         f"{identity_summary}\n\n"
@@ -740,6 +879,8 @@ async def evaluate_candidate(
         f"Zusammenfassung: {candidate.summary or candidate.snippet}\n"
         "Bewerte die Passung."
     )
+    if context_block:
+        prompt += "\n\nKontext aus Website & Unterseiten:\n" + context_block
     result = await Runner.run(agent, prompt)
     output = extract_json_block(result.final_output or "")
     try:
@@ -760,6 +901,141 @@ async def evaluate_candidate(
         reason=reason,
         search_adjustment=adjustment,
     )
+
+
+async def resolve_candidate_slug(
+    model: OpenAIChatCompletionsModel,
+    identity_summary: str,
+    candidate: CandidateInfo,
+    registry: OrganizationRegistry,
+) -> tuple[str, str]:
+    known = [
+        {
+            "slug": record.slug,
+            "name": record.name,
+            "domain": record.domain,
+            "url": record.primary_url,
+            "status": record.status,
+        }
+        for record in registry.recent_records(limit=10)
+    ]
+    agent = Agent(
+        name="Supervisor",
+        instructions=(
+            "Du bist ein Organisations-Supervisor. "
+            "Vergleiche den neuen Kandidaten mit bekannten Organisationen und entscheide, "
+            "ob er bereits existiert oder neu angelegt werden muss. "
+            "Antworte ausschließlich als JSON: "
+            '{"action": "use_existing|create_new", "slug": "kürzel", "reason": "..."}'
+        ),
+        model=model,
+    )
+    prompt = (
+        f"Identität:\n{identity_summary}\n\n"
+        "Kandidat:\n"
+        f"- Name: {candidate.name}\n"
+        f"- URL: {candidate.url}\n"
+        f"- Query: {candidate.source_query}\n"
+        f"- Zusammenfassung: {candidate.summary or candidate.snippet}\n\n"
+        "Bereits bekannte Organisationen:\n"
+        + json.dumps(known, ensure_ascii=False, indent=2)
+        + "\n\n"
+        "Bestimme, ob der Kandidat einer existierenden Organisation entspricht."
+    )
+    slug = default_org_slug(candidate)
+    reason = ""
+    try:
+        result = await Runner.run(agent, prompt)
+        data = json.loads(extract_json_block(result.final_output or ""))
+        if isinstance(data.get("slug"), str) and data.get("slug").strip():
+            slug = slugify(data["slug"].strip())
+        action = str(data.get("action", "")).lower()
+        reason = str(data.get("reason", "")).strip()
+        if action == "use_existing":
+            return slug, reason or "Supervisor: existierende Organisation erkannt."
+    except (json.JSONDecodeError, TypeError, ValueError):
+        reason = "Supervisor: Fallback-Slug genutzt."
+    return slug, reason or "Supervisor: neue Organisation angelegt."
+
+
+async def coordinate_candidate(
+    model: OpenAIChatCompletionsModel,
+    identity_summary: str,
+    candidate: CandidateInfo,
+    evaluation: EvaluationResult,
+    region: str,
+    context: Optional[CandidateContext],
+) -> CoordinatorDecision:
+    agent = Agent(
+        name="Coordinator",
+        instructions=(
+            "Du koordinierst Recherche- und Bewertungs-Agenten. "
+            "Simuliere eine kurze Unterhaltung zwischen Research (liefert Website-Eindruck) "
+            "und Evaluator (liefert Score/Reason) und treffe danach eine finale Entscheidung. "
+            "Extrahiere bei Ablehnung 1-3 Schlagwörter, die wir für neue Suchqueries nutzen können. "
+            "Wenn die Seite bereits ein Verzeichnis/Spam oder offensichtlich ungeeignet ist, "
+            "setze 'blacklist' auf true. "
+            "Antwort ausschließlich als JSON mit Feldern:\n"
+            '{"approved": bool, "reason": "...", "dialogue": ["Research: ...", "Evaluator: ...", "Coordinator: ..."], '
+            '"keyword_hints": ["..."], "blacklist": bool, "blacklist_reason": "..."}\n'
+            "Gib nur JSON zurück."
+        ),
+        model=model,
+    )
+    evaluation_context = json.dumps(asdict(evaluation), ensure_ascii=False)
+    context_block = format_context_for_prompt(context)
+    prompt = (
+        f"Identität:\n{identity_summary}\n\n"
+        f"Region-Fokus: {region}\n"
+        "Research-Agent Beobachtung:\n"
+        f"- Query: {candidate.source_query}\n"
+        f"- Name: {candidate.name}\n"
+        f"- URL: {candidate.url}\n"
+        f"- Zusammenfassung/Snippet: {candidate.summary or candidate.snippet}\n\n"
+        "Evaluator-Agent Einschätzung (JSON):\n"
+        f"{evaluation_context}\n\n"
+        "Koordinator-Aufgabe: Entscheide, ob wir diesen Kontakt wirklich übernehmen. "
+        "Wenn Zweifel bestehen, lehne lieber ab. "
+        "Extrahiere hilfreiche Stichwörter für zukünftige Suchen."
+    )
+    if context_block:
+        prompt += "\n\nZusätzlicher Kontext (Kontakt-/About-Seiten):\n" + context_block
+    result = await Runner.run(agent, prompt)
+    try:
+        data = json.loads(extract_json_block(result.final_output or ""))
+    except json.JSONDecodeError:
+        decision = CoordinatorDecision(
+            approved=False,
+            reason="Koordinator: Antwort konnte nicht interpretiert werden.",
+        )
+    else:
+        dialogue = data.get("dialogue") or []
+        if isinstance(dialogue, list):
+            dialogue_lines = [str(line).strip() for line in dialogue if str(line).strip()]
+        elif isinstance(dialogue, str):
+            dialogue_lines = [dialogue.strip()]
+        else:
+            dialogue_lines = []
+        decision = CoordinatorDecision(
+            approved=bool(data.get("approved")),
+            reason=str(data.get("reason") or "").strip() or "Koordinator: keine Begründung.",
+            dialogue=dialogue_lines,
+            keyword_hints=[
+                hint.strip()
+                for hint in (data.get("keyword_hints") or [])
+                if isinstance(hint, str) and hint.strip()
+            ],
+            blacklist=bool(data.get("blacklist")),
+            blacklist_reason=str(data.get("blacklist_reason") or "").strip(),
+        )
+    append_log(
+        "coordinator.decision",
+        candidate=candidate.name,
+        approved=decision.approved,
+        blacklist=decision.blacklist,
+        hints=len(decision.keyword_hints),
+    )
+    return decision
 
 
 async def refine_queries(
@@ -922,12 +1198,30 @@ def format_snapshot_for_prompt(snapshot: Optional[SiteSnapshot]) -> str:
     return "\n".join(parts)
 
 
+def format_context_for_prompt(context: Optional[CandidateContext]) -> str:
+    if context is None:
+        return ""
+    parts: List[str] = []
+    if context.primary:
+        parts.append("Hauptseite:\n" + format_snapshot_for_prompt(context.primary))
+    for idx, snapshot in enumerate(context.related, start=1):
+        parts.append(f"Subseite #{idx}:\n" + format_snapshot_for_prompt(snapshot))
+    return "\n\n".join(part for part in parts if part)
+
+
+def collect_candidate_context(candidate: CandidateInfo) -> CandidateContext:
+    primary = fetch_site_snapshot(candidate.url)
+    related = fetch_related_snapshots(candidate.url, max_pages=3)
+    return CandidateContext(primary=primary, related=related)
+
+
 async def run_writer_agent(
     model: OpenAIChatCompletionsModel,
     identity_summary: str,
     candidate: CandidateInfo,
     feedback: str = "",
     snapshot: Optional[SiteSnapshot] = None,
+    context: Optional[CandidateContext] = None,
 ) -> str:
     console(f"Writer erstellt Entwurf fuer {candidate.name} ...")
     agent = Agent(
@@ -942,7 +1236,9 @@ async def run_writer_agent(
         ),
         model=model,
     )
-    snapshot_context = format_snapshot_for_prompt(snapshot)
+    context_block = format_context_for_prompt(context)
+    if not context_block:
+        context_block = format_snapshot_for_prompt(snapshot)
 
     prompt = (
         f"Identitaet:\n{identity_summary}\n\n"
@@ -953,10 +1249,10 @@ async def run_writer_agent(
         "Schreibe nun ein Einladungsschreiben (Markdown) mit persoenlicher Ansprache."
         "\nBetone explizit, dass der Stand fuer gemeinnuetzige und nicht-kommerzielle Teams kostenfrei ist."
     )
-    if snapshot_context:
+    if context_block:
         prompt += (
             "\n\nZusatzinfos aus der Webseitenanalyse:\n"
-            f"{snapshot_context}\n"
+            f"{context_block}\n"
         )
     if feedback:
         prompt += (
@@ -1010,6 +1306,7 @@ async def generate_letter_with_guardrails(
     identity_summary: str,
     candidate: CandidateInfo,
     snapshot: Optional[SiteSnapshot] = None,
+    context: Optional[CandidateContext] = None,
 ) -> QAResult:
     feedback = ""
     for attempt in range(1, MAX_QA_RETRIES + 1):
@@ -1019,6 +1316,7 @@ async def generate_letter_with_guardrails(
             candidate=candidate,
             feedback=feedback,
             snapshot=snapshot,
+            context=context,
         )
         wc = word_count(letter)
         issues = []
@@ -1057,6 +1355,8 @@ async def orchestrate_search(
     search_model: Optional[OpenAIResponsesModel],
     identity_summary: str,
     plan: PlannerPlan,
+    blacklist: BlacklistManager,
+    org_registry: OrganizationRegistry,
     *,
     max_iterations: int,
     max_results_per_query: int,
@@ -1068,6 +1368,7 @@ async def orchestrate_search(
     seen_urls: set[str] = set()
     used_queries: List[str] = []
     feedback_pool: List[str] = []
+    seen_org_slugs: set[str] = set()
 
     backend_name, search_fn, store_fn = select_search_backend()
     append_log(
@@ -1083,11 +1384,25 @@ async def orchestrate_search(
     seeds_used = False
     expanded_directories: set[str] = set()
 
+    search_failed = False
+
     async def process_candidate(candidate: CandidateInfo, depth: int = 0) -> int:
         """Evaluates a candidate and expands directory-style pages if useful."""
         if candidate.url in seen_urls:
             return 0
         seen_urls.add(candidate.url)
+
+        blacklist_entry = blacklist.is_blacklisted(candidate.url)
+        if blacklist_entry:
+            candidate.notes = f"Blacklist: {blacklist_entry.reason}"
+            all_candidates.append(candidate)
+            append_log(
+                "candidate.blacklist_skip",
+                url=candidate.url,
+                domain=blacklist_entry.domain,
+                reason=blacklist_entry.reason,
+            )
+            return 1
 
         if not candidate_matches_region(candidate, region):
             reason = "Außerhalb Norddeutschland (Geo-Heuristik)."
@@ -1103,6 +1418,48 @@ async def orchestrate_search(
             feedback_pool.append(evaluation.search_adjustment)
             return 1
 
+        org_slug, slug_reason = await resolve_candidate_slug(
+            model=model,
+            identity_summary=identity_summary,
+            candidate=candidate,
+            registry=org_registry,
+        )
+        candidate.org_slug = org_slug
+        candidate.duplicate_reason = slug_reason
+        existing_record = org_registry.get(org_slug)
+        if org_slug in seen_org_slugs:
+            append_log(
+                "candidate.duplicate.run_skip",
+                slug=org_slug,
+                name=candidate.name,
+                url=candidate.url,
+                reason=slug_reason,
+            )
+            candidate.notes = slug_reason or "Bereits im aktuellen Lauf aufgenommen."
+            all_candidates.append(candidate)
+            return 1
+        if existing_record and existing_record.status in {"accepted", "contacted"}:
+            reason = slug_reason or f"Organisation bereits {existing_record.status}."
+            append_log(
+                "candidate.duplicate.registry_skip",
+                slug=org_slug,
+                name=candidate.name,
+                status=existing_record.status,
+                reason=reason,
+            )
+            candidate.notes = reason
+            all_candidates.append(candidate)
+            return 1
+        org_registry.upsert(
+            org_slug,
+            name=candidate.name,
+            domain=domain_key(candidate.url),
+            url=candidate.url,
+            status=existing_record.status if existing_record else "seen",
+            notes=slug_reason,
+        )
+        seen_org_slugs.add(org_slug)
+
         is_directory = looks_like_directory_candidate(candidate)
 
         if is_directory:
@@ -1113,26 +1470,86 @@ async def orchestrate_search(
                 search_adjustment="konkrete Organisation mit eigener Kontaktseite finden",
             )
         else:
-            evaluation = await evaluate_candidate(model, identity_summary, candidate)
+            context_obj = await asyncio.to_thread(collect_candidate_context, candidate)
+            candidate.context = context_obj
+            evaluation = await evaluate_candidate(model, identity_summary, candidate, context_obj)
         candidate.evaluation = evaluation
-        candidate.notes = evaluation.reason
+
+        coordination: Optional[CoordinatorDecision] = None
+        if not is_directory:
+            coordination = await coordinate_candidate(
+                model=model,
+                identity_summary=identity_summary,
+                candidate=candidate,
+                evaluation=evaluation,
+                region=region,
+                context=candidate.context,
+            )
+            candidate.coordination = coordination
+
+        note_parts = [evaluation.reason]
+        if coordination:
+            note_parts.append(f"Koordinator: {coordination.reason}")
+            if coordination.dialogue:
+                note_parts.append("Dialog: " + " | ".join(coordination.dialogue[:3]))
+        candidate.notes = " / ".join(part for part in note_parts if part)
         all_candidates.append(candidate)
 
+        if coordination and coordination.keyword_hints:
+            feedback_pool.extend(coordination.keyword_hints)
+
+        if coordination and coordination.blacklist:
+            reason = coordination.blacklist_reason or coordination.reason
+            blacklist.add(
+                candidate.url,
+                reason=reason,
+                tag="coordinator",
+                source="coordinator",
+                meta={"candidate": candidate.name},
+            )
+            append_log(
+                "blacklist.add",
+                url=candidate.url,
+                reason=reason,
+                tag="coordinator",
+            )
+
         processed = 1
+        coordinator_override = False
+        if coordination and coordination.approved and not evaluation.accepted:
+            score_gate = evaluation.score >= max(0.25, accept_threshold * 0.85)
+            coordinator_override = score_gate and not coordination.blacklist
+
+        should_accept = (
+            (
+                evaluation.accepted
+                and evaluation.score >= accept_threshold
+            )
+            or coordinator_override
+        )
+        if coordination:
+            should_accept = (
+                should_accept
+                and coordination.approved
+                and not coordination.blacklist
+            )
+
         if (
-            evaluation.accepted
-            and evaluation.score >= accept_threshold
+            should_accept
             and not is_directory
             and len(accepted) < plan.target_candidates
         ):
             accepted.append(candidate)
             console(f"Kandidat akzeptiert: {candidate.name}")
+            if candidate.org_slug:
+                org_registry.mark_status(candidate.org_slug, "accepted")
         elif evaluation.search_adjustment:
             feedback_pool.append(evaluation.search_adjustment)
 
         should_expand = (
             depth < DIRECTORY_MAX_DEPTH
             and candidate.url not in expanded_directories
+            and not (coordination and coordination.blacklist)
             and (
                 is_directory
                 or (
@@ -1198,13 +1615,24 @@ async def orchestrate_search(
                     console(f"WebSearchTool Fehler fuer '{query}': {exc}")
 
             if not results:
-                results = await asyncio.to_thread(
-                    search_fn,
-                    query,
-                    max_results=max_results_per_query,
-                )
-                backend_used = backend_name
-                console(f"{backend_name} Suche fuer '{query}' gestartet ...")
+                try:
+                    results = await asyncio.to_thread(
+                        search_fn,
+                        query,
+                        max_results=max_results_per_query,
+                    )
+                    backend_used = backend_name
+                    console(f"{backend_name} Suche fuer '{query}' gestartet ...")
+                except Exception as exc:
+                    append_log(
+                        "search.error",
+                        backend=backend_name,
+                        query=query,
+                        error=str(exc),
+                    )
+                    console(f"{backend_name} Suche abgebrochen (Limit/Fehler): {exc}")
+                    search_failed = True
+                    break
 
             if not results:
                 cached_results = (
@@ -1219,6 +1647,7 @@ async def orchestrate_search(
                     console(f"Cache-Treffer fuer '{query}' ({len(results)} Ergebnisse).")
 
             if results:
+                results = await filter_search_results(model, identity_summary, query, results)
                 store_fn(query, results)
                 append_log(
                     "search.results",
@@ -1245,6 +1674,11 @@ async def orchestrate_search(
                 new_candidates_in_iteration += processed
 
         if len(accepted) >= plan.target_candidates:
+            break
+
+        if search_failed:
+            console("Suche wurde aufgrund eines Fehlers/Limit erreicht. Nutze vorhandene Kandidaten.")
+            append_log("search.partial", reason="search_failed", accepted=len(accepted), considered=len(all_candidates))
             break
 
         remaining = plan.target_candidates - len(accepted)
@@ -1333,6 +1767,13 @@ async def async_main() -> None:
         target=plan.target_candidates,
     )
 
+    blacklist = BlacklistManager()
+    console(f"Geladene Blacklist-Eintraege: {len(blacklist)}")
+    append_log("blacklist.loaded", entries=len(blacklist))
+    org_registry = OrganizationRegistry()
+    console(f"Geladene Organisations-Registry: {len(org_registry)}")
+    append_log("registry.loaded", entries=len(org_registry))
+
     if search_model is None and not has_google_config() and plan.target_candidates > MAX_FALLBACK_TARGET:
         plan.target_candidates = MAX_FALLBACK_TARGET
         append_log(
@@ -1343,16 +1784,47 @@ async def async_main() -> None:
 
     accept_threshold = presets["accept_threshold"]
 
-    accepted, all_candidates, backend_name, empty_searches = await orchestrate_search(
-        chat_model,
-        search_model,
-        identity_summary,
-        plan,
-        max_iterations=max_iterations,
-        max_results_per_query=max_results_per_query,
-        region=args.region,
-        accept_threshold=accept_threshold,
-    )
+    resume_candidates: Optional[List[CandidateInfo]] = None
+    if args.resume_candidates:
+        resume_path = Path(args.resume_candidates)
+        resume_candidates = load_candidates_from_snapshot(resume_path)
+        if not resume_candidates:
+            raise RuntimeError(f"Snapshot {resume_path} enthält keine akzeptierten Kandidaten.")
+        console(f"Resume-Modus: {len(resume_candidates)} Kandidaten aus {resume_path} geladen.")
+        append_log(
+            "resume.loaded",
+            path=str(resume_path),
+            candidates=len(resume_candidates),
+        )
+
+    if resume_candidates is not None:
+        accepted = resume_candidates
+        all_candidates = list(resume_candidates)
+        backend_name = "resume"
+        empty_searches = 0
+        for candidate in accepted:
+            candidate.org_slug = candidate.org_slug or default_org_slug(candidate)
+            org_registry.upsert(
+                candidate.org_slug,
+                name=candidate.name,
+                domain=domain_key(candidate.url),
+                url=candidate.url,
+                status="accepted",
+                notes="Resume-Modus",
+            )
+    else:
+        accepted, all_candidates, backend_name, empty_searches = await orchestrate_search(
+            chat_model,
+            search_model,
+            identity_summary,
+            plan,
+            blacklist,
+            org_registry,
+            max_iterations=max_iterations,
+            max_results_per_query=max_results_per_query,
+            region=args.region,
+            accept_threshold=accept_threshold,
+        )
     if not accepted:
         hint = ""
         if backend_name == "duckduckgo" and not has_google_config() and search_model is None:
@@ -1403,12 +1875,16 @@ async def async_main() -> None:
         console("Keine passenden Kandidaten für Anschreiben gefunden.")
     else:
         for candidate in letter_candidates:
-            snapshot = await asyncio.to_thread(fetch_site_snapshot, candidate.url)
+            context = candidate.context
+            snapshot = context.primary if context else None
+            if snapshot is None:
+                snapshot = await asyncio.to_thread(fetch_site_snapshot, candidate.url)
             qa_result = await generate_letter_with_guardrails(
                 chat_model,
                 identity_summary,
                 candidate,
                 snapshot=snapshot,
+                context=context,
             )
             letter_path = store_letter(candidate, qa_result.letter, qa_notes=qa_result.notes)
             append_log(
@@ -1418,10 +1894,33 @@ async def async_main() -> None:
                 qa_notes=qa_result.notes,
             )
             console(f"Anschreiben gespeichert unter: {letter_path}")
+            if candidate.org_slug:
+                org_registry.mark_status(candidate.org_slug, "contacted")
+            blacklist.add(
+                candidate.url,
+                reason="Bereits angeschrieben (Einladung gesendet).",
+                tag="contacted",
+                meta={"letter_path": str(letter_path)},
+            )
+            append_log(
+                "blacklist.add",
+                url=candidate.url,
+                reason="Bereits angeschrieben",
+                tag="contacted",
+            )
             letters_written += 1
             if letters_written >= letter_limit:
                 break
     append_log("pipeline.done", accepted=len(accepted), letters=letters_written)
+
+    persisted = blacklist.persist()
+    if persisted:
+        append_log("blacklist.persisted", path=str(persisted))
+        console(f"Blacklist aktualisiert: {persisted}")
+    reg_path = org_registry.save()
+    if reg_path:
+        append_log("registry.persisted", path=str(reg_path))
+        console(f"Organisations-Registry aktualisiert: {reg_path}")
 
 
 if __name__ == "__main__":
@@ -1430,4 +1929,3 @@ if __name__ == "__main__":
     except Exception as exc:  # pragma: no cover
         append_log("pipeline.failed", error=str(exc))
         raise
-import argparse

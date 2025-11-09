@@ -49,11 +49,14 @@
 - **Planner/Triage-Agent**: Nimmt Nutzeranfragen entgegen, bricht sie in Recherche-Tasks herunter und erstellt Suchaufträge.
 - **Recherche-Agenten** / **Search-Orchestrator**: Fokussieren Suchqueries auf non-kommerzielle Kollektive (Chaotikum, Fuchsbau, offene Werkstätten) und führen Google- bzw. DuckDuckGo-Recherchen durch, persistieren Treffer und reichen sie an Evaluator:innen weiter.
 - **Evaluator-Agenten**: Prüfen Treffer auf Relevanz, verwerfen ungeeignete Ergebnisse und priorisieren vielversprechende Kandidaten.
+- **ResultFilter-Agent**: Dedupliziert Suchtreffer pro Query (gleiche Domains, reine Verzeichnisse), priorisiert Kontakt-/About-Seiten und reicht nur vielversprechende URLs an die Evaluator:innen weiter.
+- **Supervisor-Agent**: Ordnet Kandidaten einer Organisations-Registry (`data/staging/organizations_registry.json`) zu, erkennt Dubletten über mehrere Läufe hinweg und entscheidet, ob ein neuer Datensatz angelegt oder ein bestehender weitergeführt wird.
 - **Query-Refiner**: Analysiert Evaluator-Feedback und generiert neue Suchqueries, bis Zielanzahl erreicht oder Suchraum ausgeschöpft ist.
 - **Crawler/Extractor**: Extrahieren Kerninformationen aus Webseiten/Dokumenten (Kontakt, Projekte, USP, Anforderungen).
 - **Personalisierungs-Agent**: Kombiniert extrahierte Daten mit Identitätsdatei, erstellt strukturierte Profile.
 - **Writer-Agent**: Generiert personalisierte Anschreiben, betont kostenlosen Stand für gemeinnützige/nicht-kommerzielle Teams und legt die Dateien (inkl. Quellenverweis) ab.
 - **QA/Guardrail-Agent** (aktiv in `workflows/research_pipeline.py`): Erzwingt DIN-A4-konforme Länge, keine Versprechen/Garantien und protokolliert Freigaben.
+- **Koordinator-Agent**: Moderiert die Unterhaltung zwischen Recherche- und Evaluations-Agenten, validiert Kandidaten final, extrahiert neue Stichwörter für weitere Queries und pflegt die Domain-Blacklist, damit keine Website doppelt angeschrieben wird.
 
 ## Risiken & Stolperfallen
 - Fehlende Guardrails können zu falschen oder unsicheren Anschreiben führen → Validierung verpflichtend.
@@ -69,9 +72,13 @@
 - Suchtreffer und Evaluations-Snapshots versionierbar halten (`data/staging/search/`, `data/staging/candidates_selected.json`), um Feedback-Loops nachvollziehen zu können.
 - Ergebnisse der Directory-Parser-Läufe (`data/staging/directory_expansions/`) speichern, damit nachvollziehbar bleibt, welche Sammelseiten wir in konkrete Kontakte aufgelöst haben.
 - Automatische Webseiten-Snapshots für personalisierte Anschreiben liegen in `data/staging/snapshots/` (generiert durch `tools/site_scraper.py`).
+- Snapshots umfassen auch relevante Unterseiten (Kontakt, About, Impressum), damit Evaluator:innen und Koordinatoren mehr Kontext erhalten.
+- Organisations-Registry unter `data/staging/organizations_registry.json` hält Slugs, Status (seen/accepted/contacted) und verhindert Mehrfachbearbeitung; gepflegt via `tools/org_registry.py` und Supervisor-Agent.
 - Geo-Heuristiken (Nominatim-Stub) filtern Off-Region-Treffer direkt in der Pipeline; zukünftige echte Geocode-APIs können dieselbe Schnittstelle weiterverwenden.
 - Metadaten (z. B. Bewertung, Quelle, Zeitstempel) in YAML/JSON neben den Texten speichern, damit Versionierung per Git möglich bleibt.
 - Details zu Ablageformaten, QA-Metadaten und Logging stehen in `docs/data_persistence.md`. Pipelinelogs landen in `logs/pipeline.log` (JSON pro Event).
+- Kontakte, die bereits angeschrieben oder aufgrund von Qualitätsproblemen gesperrt wurden, landen in `data/staging/blacklist.json` (verwaltet über `tools/blacklist.py`). Die Datei verhindert doppelte Anschreiben und dokumentiert Sperrgründe.
+- `tools/seed_registry.py` kann bei Bedarf genutzt werden, um `data/staging/candidates_selected.json` zu deduplizieren und die Organisations-Registry aus bestehenden Daten neu zu befüllen.
 
 ## Identität & Kontext
 - `config/identity.yaml` enthält das aktuelle Profil von Marco Gabrecht und der Maker Faire Lübeck 2026.
@@ -91,7 +98,10 @@
 - [x] Offizielles Tooling aus dem OpenAI *research_bot* nachbilden (Pydantic-Planner, Tool-Aufrufe per `Runner.run` in async-Tasks, Trace-Integration).
 - [x] QA-Agent integrieren, der Anschreiben vor Versand validiert.
 - [x] Directory-Parser integrieren, damit Sammelseiten automatisiert neue Kandidat:innen liefern.
-- [ ] Quellen- und Domainfilter verschärfen (reine Verzeichnisse/Event-Seiten früh blocken).
+- [x] Quellen- und Domainfilter verschärfen (LLM-Koordinator, heuristische Blocklisten & Domain-Blacklist).
+- [x] Koordinator-Agent + Domain-Blacklist einführen (Mini-Dialoge, Keyword-Handoffs, keine doppelten Anschreiben).
+- [x] ResultFilter + Subseiten-Scraper einführen (deduplizierte Treffer, automatische Kontakt-/About-Infos für Evaluator & Koordinator).
+- [x] Organisations-Supervisor + Registry etablieren (Slug-Zuordnung, Persistenz `organizations_registry.json`, deduplizierte Mehrfachtreffer).
 - [ ] Nonprofit/Maker-Scoring einführen (Region, Quelle, DIY/Nonprofit-Merkmale bevor `accepted=True`).
 - [ ] Deduplizierung & Kanonisierung von Organisationen (Subseiten als Tags, eine Kontaktkartei).
 - [ ] Kontakt-Extraktion (Impressum/Schema.org) + CSV/Markdown-Export für Outreach.

@@ -7,9 +7,9 @@ import re
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import List, Optional
+from typing import Iterable, List, Optional
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 from urllib.request import Request, urlopen
 
 from lxml import html
@@ -34,6 +34,18 @@ LOCATION_CUES = [
     "braunschweig",
     "norderstedt",
 ]
+RELATED_PATH_HINTS = [
+    "kontakt",
+    "contact",
+    "kontaktformular",
+    "impressum",
+    "about",
+    "ueber-uns",
+    "über-uns",
+    "team",
+    "mitmachen",
+]
+MAX_RELATED_PAGES = 4
 
 
 class SiteScraperError(RuntimeError):
@@ -165,4 +177,32 @@ def fetch_site_snapshot(url: str, *, use_cache: bool = True) -> Optional[SiteSna
     return snapshot
 
 
-__all__ = ["SiteSnapshot", "SiteScraperError", "fetch_site_snapshot"]
+def build_related_urls(url: str, hints: Iterable[str] = RELATED_PATH_HINTS) -> List[str]:
+    parsed = urlparse(url)
+    base = f"{parsed.scheme}://{parsed.netloc}"
+    related: List[str] = []
+    seen: set[str] = set()
+    for hint in hints:
+        candidate = urljoin(base, f"/{hint.strip('/')}")
+        candidate = candidate.rstrip("/")
+        if candidate.lower() == url.rstrip("/").lower():
+            continue
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        related.append(candidate)
+        if len(related) >= MAX_RELATED_PAGES:
+            break
+    return related
+
+
+def fetch_related_snapshots(url: str, *, max_pages: int = MAX_RELATED_PAGES, use_cache: bool = True) -> List[SiteSnapshot]:
+    snapshots: List[SiteSnapshot] = []
+    for candidate in build_related_urls(url)[:max_pages]:
+        snapshot = fetch_site_snapshot(candidate, use_cache=use_cache)
+        if snapshot:
+            snapshots.append(snapshot)
+    return snapshots
+
+
+__all__ = ["SiteSnapshot", "SiteScraperError", "fetch_site_snapshot", "fetch_related_snapshots", "build_related_urls"]
