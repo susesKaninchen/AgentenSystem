@@ -24,6 +24,20 @@ if not exist "%PYTHON_EXE%" (
 
 set "DEFAULT_PHASE=refine"
 set "DEFAULT_REGION=luebeck-local"
+set "DEFAULT_RESUME=data/staging/candidates_selected.json"
+
+echo(
+echo [PROMPT] Kandidaten-Snapshot vor dem Lauf deduplizieren (tools/seed_registry.py)?
+set /p "DEDUPE_CHOICE=Vorab aufraeumen (y/N): "
+if /I "%DEDUPE_CHOICE%"=="Y" (
+    echo [INFO] Fuehre tools/seed_registry.py aus ...
+    uv run %ENV_FLAG% python tools/seed_registry.py
+    if errorlevel 1 (
+        echo [WARN] seed_registry.py meldete Fehler %errorlevel%.
+    ) else (
+        echo [OK] Deduplizierung abgeschlossen.
+    )
+)
 
 echo(
 echo [PROMPT] Bitte Phase auswaehlen:
@@ -69,6 +83,17 @@ if %LETTER_CHOICE% LSS 1 set "LETTER_CHOICE=1"
 if %LETTER_CHOICE% GTR 5 set "LETTER_CHOICE=5"
 set "LETTERS_ARG=--letters-per-run %LETTER_CHOICE%"
 
+echo(
+echo [PROMPT] Resume-Modus nutzen (bestehende Kandidaten ohne neue Suche)?
+set /p "RESUME_CHOICE=Resume verwenden (y/N): "
+set "RESUME_ARG="
+set "RESUME_FILE="
+if /I "%RESUME_CHOICE%"=="Y" (
+    set /p "RESUME_FILE=Snapshot-Datei [%DEFAULT_RESUME%]: "
+    if "%RESUME_FILE%"=="" set "RESUME_FILE=%DEFAULT_RESUME%"
+    set "RESUME_ARG=--resume-candidates \"%RESUME_FILE%\""
+)
+
 set "PHASE_ARG=--phase %PIPELINE_PHASE%"
 set "REGION_ARG=--region %PIPELINE_REGION%"
 
@@ -77,9 +102,14 @@ echo [INFO] Starte Recherche-Pipeline via uv ...
 echo         Phase  : %PIPELINE_PHASE%
 echo         Region : %PIPELINE_REGION%
 echo         Briefe : %LETTER_CHOICE%
+if defined RESUME_ARG (
+    echo         Resume : %RESUME_FILE%
+) else (
+    echo         Resume : nein
+)
 echo         (weitere Argumente aus CLI: %*)
 echo.
-uv run %ENV_FLAG% python workflows/research_pipeline.py %PHASE_ARG% %REGION_ARG% %LETTERS_ARG% %*
+uv run %ENV_FLAG% python workflows/research_pipeline.py %PHASE_ARG% %REGION_ARG% %LETTERS_ARG% %RESUME_ARG% %*
 if errorlevel 1 (
     echo [ERR] Pipeline beendet mit Fehlercode %errorlevel%.
 ) else (

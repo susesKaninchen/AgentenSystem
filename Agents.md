@@ -79,6 +79,7 @@
 - Details zu Ablageformaten, QA-Metadaten und Logging stehen in `docs/data_persistence.md`. Pipelinelogs landen in `logs/pipeline.log` (JSON pro Event).
 - Kontakte, die bereits angeschrieben oder aufgrund von Qualitätsproblemen gesperrt wurden, landen in `data/staging/blacklist.json` (verwaltet über `tools/blacklist.py`). Die Datei verhindert doppelte Anschreiben und dokumentiert Sperrgründe.
 - `tools/seed_registry.py` kann bei Bedarf genutzt werden, um `data/staging/candidates_selected.json` zu deduplizieren und die Organisations-Registry aus bestehenden Daten neu zu befüllen.
+- Windows-Shortcut: `run_research_pipeline.bat` bietet interaktive Prompts für Phase/Region/Briefe, optionales Seed/Dedupe (`tools/seed_registry.py`) und kann den Resume-Modus ohne manuelle CLI-Flags starten (Snapshot-Datei wird abgefragt).
 
 ## Identität & Kontext
 - `config/identity.yaml` enthält das aktuelle Profil von Marco Gabrecht und der Maker Faire Lübeck 2026.
