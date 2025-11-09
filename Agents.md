@@ -21,6 +21,11 @@
   - `OPENAI_MODEL`
   - `GOOGLE_API_KEY` (optional – ohne fällt die Suche auf DuckDuckGo zurück)
   - `GOOGLE_SEARCH_ENGINE_ID` (optional – benötigt für Google Custom Search)
+- Feintuning-Variablen:
+  - `PIPELINE_MAX_ITERATIONS` (Standard 10) – bestimmt, wie viele Suchrunden gefahren werden.
+  - `PIPELINE_RESULTS_PER_QUERY` (Standard 10) – Anzahl der Webresultate pro Query.
+  - `MAX_LETTERS_PER_RUN` (Standard 3) – wie viele Anschreiben pro Lauf generiert werden.
+- Laufzeit-Presets können auch über CLI gewählt werden: `python workflows/research_pipeline.py --phase <explore|refine|acquire> --region <nord|hamburg|luebeck|...>`. Ohne Flags greifen die oben genannten Env-Variablen.
 - Bei lokalen Tests `dotenv` laden oder Environment im Deployment konfigurieren.
 - Beispielkonfiguration liegt in `.env.example` (nur Platzhalter, keine echten Werte).
 - `ENABLE_WEB_SEARCH_TOOL=0/1` steuert, ob das OpenAI-WebSearchTool genutzt wird. Bei `0` laufen wir direkt über DuckDuckGo/Seeds.
@@ -33,9 +38,11 @@
   - Datenspeicher für gecrawlte Ergebnisse (z. B. `data/staging/`) und persistierte Anschreiben (`outputs/letters/`).
 - NorthData (https://www.northdata.de) für Firmenhintergründe via Suggest-API, Ergebnisse werden automatisch unter `data/staging/enrichment/` abgelegt.
 - WebSearchTool (OpenAI Responses API) ist der Standard für Recherche; wenn das nicht verfügbar ist, fällt das System auf Google/DuckDuckGo (`tools/google_search.py` / `tools/duckduckgo.py`) und eine Seed-Liste (Chaotikum, Fuchsbau, Freies Labor, Hackerspace Bremen, Chaostreff Flensburg) zurück. Query- und Ergebnis-Logs liegen in `data/staging/search/`.
+- Sammelseiten/Verzeichnisse (z. B. „Werkstätten-Übersichten“, „Meet the Makers“) werden automatisch mit `tools/directory_parser.py` ausgewertet; die daraus extrahierten Untereinträge landen als neue Kandidat:innen in der Pipeline und werden in `data/staging/directory_expansions/` gecacht.
+- PDF-/Listenquellen (z. B. bundestag.de, scribd.com) sowie andere „schwergewichtige“ Domains werden vor der Evaluierung herausgefiltert, um irrelevante Treffer zu vermeiden.
 - Bei wiederholten Rate-Limits zieht der Workflow lokale Seed-Kandidaten (Chaotikum, Fuchsbau, Freies Labor, Hackerspace Bremen, Chaostreff Flensburg) heran, damit Evaluator:innen und Writer weiterarbeiten können.
-- OpenAI-Beispiel *research_bot* demonstriert bewährte Muster: Planner mit Pydantic-Ausgabe, asynchroner Such-Manager (`Runner.run` in Tasks) und Tool-basierte Websuche (`WebSearchTool`). Diese Konzepte übernehmen wir für planbare, streaming-fähige Feedback-Loops.
-- Pipeline nutzt inzwischen `Runner.run` asynchron für Planner-, Research- und Writer-Agenten; weitere Schritte (Tool-Aufrufe, echte Suche) folgen nach API-/Proxy-Verfügbarkeit.
+- OpenAI-Beispiel *research_bot* demonstriert bewährte Muster: Planner mit Pydantic-Ausgabe, asynchroner Such-Manager (`Runner.run` in Tasks) und Tool-basierte Websuche (`WebSearchTool`). Diese Konzepte übernehmen wir für planbare, streaming-fähige Feedback-Loops. Ergänzend nutzt der Writer strukturierte Snapshots aus `tools/site_scraper.py`, damit Anschreiben konkreten Kontext enthalten.
+- Pipeline nutzt inzwischen `Runner.run` asynchron für Planner-, Research- und Writer-Agenten; weitere Schritte (Tool-Aufrufe, echte Suche) folgen nach API-/Proxy-Verfügbarkeit. Writer personalisiert Anschreiben anhand strukturierter Snapshots aus `tools/site_scraper.py`, die automatisch aus den Kandidaten-Webseiten extrahiert werden.
 - Externe Recherchequellen: öffentliche Webseiten, Verzeichnisse zu Maker-/FabLab-Ausstellern, Social Media Profile. Agenten sollten Quellen jeweils protokollieren (URL + Datum).
 
 ## Geplante Agentenrollen
@@ -60,6 +67,9 @@
 - Strukturierte Ergebnisse pro Auftrag als eigenständige Datei ablegen (`data/staging/` für Rohdaten, `outputs/letters/` für Anschreiben).
 - Externe Anreicherungen (z. B. NorthData) separat versionierbar speichern (`data/staging/enrichment/`).
 - Suchtreffer und Evaluations-Snapshots versionierbar halten (`data/staging/search/`, `data/staging/candidates_selected.json`), um Feedback-Loops nachvollziehen zu können.
+- Ergebnisse der Directory-Parser-Läufe (`data/staging/directory_expansions/`) speichern, damit nachvollziehbar bleibt, welche Sammelseiten wir in konkrete Kontakte aufgelöst haben.
+- Automatische Webseiten-Snapshots für personalisierte Anschreiben liegen in `data/staging/snapshots/` (generiert durch `tools/site_scraper.py`).
+- Geo-Heuristiken (Nominatim-Stub) filtern Off-Region-Treffer direkt in der Pipeline; zukünftige echte Geocode-APIs können dieselbe Schnittstelle weiterverwenden.
 - Metadaten (z. B. Bewertung, Quelle, Zeitstempel) in YAML/JSON neben den Texten speichern, damit Versionierung per Git möglich bleibt.
 - Details zu Ablageformaten, QA-Metadaten und Logging stehen in `docs/data_persistence.md`. Pipelinelogs landen in `logs/pipeline.log` (JSON pro Event).
 
@@ -80,6 +90,12 @@
 - [x] Datenquellen-Anbindung (Google Custom Search + NorthData-Enrichment) automatisieren, inklusive Feedback-Schleifen und Persistenz.
 - [x] Offizielles Tooling aus dem OpenAI *research_bot* nachbilden (Pydantic-Planner, Tool-Aufrufe per `Runner.run` in async-Tasks, Trace-Integration).
 - [x] QA-Agent integrieren, der Anschreiben vor Versand validiert.
+- [x] Directory-Parser integrieren, damit Sammelseiten automatisiert neue Kandidat:innen liefern.
+- [ ] Quellen- und Domainfilter verschärfen (reine Verzeichnisse/Event-Seiten früh blocken).
+- [ ] Nonprofit/Maker-Scoring einführen (Region, Quelle, DIY/Nonprofit-Merkmale bevor `accepted=True`).
+- [ ] Deduplizierung & Kanonisierung von Organisationen (Subseiten als Tags, eine Kontaktkartei).
+- [ ] Kontakt-Extraktion (Impressum/Schema.org) + CSV/Markdown-Export für Outreach.
+- [ ] Manuelle Checkliste/Sicherheitsnetz vor Versand der Briefe (Region, Nonprofit, Kontakt plausibel).
 
 ## Offene Fragen
 - Welche konkreten Datenquellen stehen für die Recherche langfristig zur Verfügung (APIs, interne Datenbanken)?

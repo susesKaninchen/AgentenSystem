@@ -6,7 +6,7 @@ organization:
   description: >
     Offene Hightech-Werkstatt (gemeinnütziger Verein) in Lübeck.
     Unterstützt Maker:innen, Unternehmen und Bildungseinrichtungen beim Basteln, Prototyping und Wissensaustausch.
-  location: "Musikhochschulallee 1, 23552 Lübeck, Deutschland"
+  location: "Maria-Goeppert-Straße 9a, 23562 Lübeck, Deutschland"
   website: "https://fablab-luebeck.de"
 
 representative:
@@ -17,7 +17,7 @@ representative:
     - "Kontaktaufnahme mit Ausstellenden und Partner:innen"
     - "Strategische Ausrichtung des Vereins"
   contact:
-    email: "info@fablab-luebeck.de"
+    email: "makerfaire@fablab-luebeck.de"
     phone: ""  # Optional, bei Bedarf ergänzen
 
 event:

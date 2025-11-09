@@ -90,7 +90,7 @@ def fetch_suggestions(
     return suggestions
 
 
-def slugify(value: str) -> str:
+def slugify(value: str, max_length: int = 120) -> str:
     sanitized = (
         value.lower()
         .replace(" ", "-")
@@ -111,7 +111,10 @@ def slugify(value: str) -> str:
     )
     while "--" in sanitized:
         sanitized = sanitized.replace("--", "-")
-    return sanitized.strip("-")
+    sanitized = sanitized.strip("-")
+    if len(sanitized) > max_length:
+        sanitized = sanitized[:max_length].rstrip("-")
+    return sanitized
 
 
 def store_suggestions(
@@ -127,7 +130,8 @@ def store_suggestions(
     """
     target_dir.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    file_path = target_dir / f"northdata_{slugify(query)}.json"
+    slug = slugify(query)
+    file_path = target_dir / f"northdata_{slug}.json"
     payload = {
         "query": query,
         "fetched_at": timestamp,

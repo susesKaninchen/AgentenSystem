@@ -1,0 +1,36 @@
+{
+  "source": "https://makerspace-hamburg.de/",
+  "generated_at": "2025-11-09T13:39:50+00:00",
+  "entries": [
+    {
+      "name": "Makerhafen",
+      "url": "https://makerspace-hamburg.de/makerhafen",
+      "description": "Gefunden über https://makerspace-hamburg.de/"
+    },
+    {
+      "name": "OpenLab Hamburg",
+      "url": "https://makerspace-hamburg.de/openlab",
+      "description": "Gefunden über https://makerspace-hamburg.de/"
+    },
+    {
+      "name": "Fabulous St. Pauli",
+      "url": "https://makerspace-hamburg.de/fabulous-st-pauli",
+      "description": "Gefunden über https://makerspace-hamburg.de/"
+    },
+    {
+      "name": "HoFaLab",
+      "url": "https://makerspace-hamburg.de/hofalab",
+      "description": "Gefunden über https://makerspace-hamburg.de/"
+    },
+    {
+      "name": "Welcome Werkstatt",
+      "url": "https://makerspace-hamburg.de/welcome-werkstatt",
+      "description": "Wer im Raum Barmbek unterwegs ist, kann auch mal bei der  reinschauen. Für den Raum Norderstedt kann ein Blick in die Offene Werkstatt Norderstedt nicht schaden. Die ist zwar nicht direkt in Hamburg, aber durchaus leicht zu erreichen, da Norderstedt gut an den ÖPNV von Hamburg angebunden ist."
+    },
+    {
+      "name": "Offene Werkstatt Norderstedt",
+      "url": "https://makerspace-hamburg.de/offene-werkstatt-norderstedt",
+      "description": "Wer im Raum Barmbek unterwegs ist, kann auch mal bei der Welcome Werkstatt reinschauen. Für den Raum Norderstedt kann ein Blick in die  nicht schaden. Die ist zwar nicht direkt in Hamburg, aber durchaus leicht zu erreichen, da Norderstedt gut an den ÖPNV von Hamburg angebunden ist."
+    }
+  ]
+}

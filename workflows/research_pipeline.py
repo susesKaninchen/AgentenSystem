@@ -15,6 +15,7 @@ so dass der Ablauf auditierbar bleibt.
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import json
 import os
@@ -23,6 +24,7 @@ from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Iterable, List, Optional, Sequence, Protocol, Tuple
+from urllib.parse import urlparse
 
 from agents import Agent, Runner
 from agents.models.openai_chatcompletions import OpenAIChatCompletionsModel
@@ -31,6 +33,7 @@ from agents.tracing import set_tracing_disabled
 from openai import AsyncOpenAI
 
 from tools.identity_loader import get_identity_summary, load_identity
+from tools.directory_parser import DirectoryEntry, DirectoryParserError, expand_directory
 from tools.google_search import (
     GoogleSearchResult,
     iter_queries,
@@ -50,6 +53,7 @@ from tools.northdata import (
     format_top_suggestion,
     store_suggestions,
 )
+from tools.site_scraper import SiteSnapshot, fetch_site_snapshot
 from tools.web_search_agent import run_web_search_agent
 
 
@@ -68,8 +72,8 @@ def console(message: str) -> None:
     print(f"[PIPELINE] {message}")
 
 DEFAULT_TARGET_CANDIDATES = 50
-MAX_ITERATIONS = 5
-MAX_RESULTS_PER_QUERY = 6
+DEFAULT_MAX_ITERATIONS = 10
+DEFAULT_MAX_RESULTS_PER_QUERY = 10
 EVALUATION_ACCEPT_THRESHOLD = 0.62
 NORTHDATA_COUNTRIES = "DE"
 MAX_QA_RETRIES = 3
@@ -81,6 +85,68 @@ PROMISE_PATTERNS = [
     r"\bverpflicht",
     r"\bsichern\s+zu",
     r"\bdefinitiv\b",
+]
+NEGATIVE_URL_SUFFIXES = (".pdf", ".csv", ".doc", ".ppt", ".xls", ".zip")
+NEGATIVE_DOMAINS = {
+    "bundestag.de",
+    "scribd.com",
+    "editeur.org",
+    "b-u-b.de",
+    "telekom-stiftung.de",
+    "bne-portal.de",
+    "schleswig-holstein.de",
+}
+NORD_REGION_KEYWORDS = [
+    "norddeutsch",
+    "schleswig",
+    "holstein",
+    "hamburg",
+    "bremen",
+    "niedersachsen",
+    "mecklenburg",
+    "vorpommern",
+    "lübeck",
+    "luebeck",
+    "kiel",
+    "flensburg",
+    "rostock",
+    "greifswald",
+    "oldenburg",
+    "bremerhaven",
+    "hannover",
+    "braunschweig",
+]
+REGION_POSITIVE_KEYWORDS = {
+    "hamburg": ["hamburg", "altona", "harburg", "wandsbek", "ottensen"],
+    "luebeck": ["lübeck", "luebeck", "stockelsdorf", "bad schwartau", "arfrade", "travemünde"],
+    "kiel": ["kiel", "schleswig", "neumünster", "plön"],
+    "hannover": ["hannover", "braunschweig", "hildesheim", "celle"],
+}
+OFF_REGION_KEYWORDS = [
+    "bochum",
+    "oberhausen",
+    "dortmund",
+    "essen",
+    "münchen",
+    "munchen",
+    "bayern",
+    "stuttgart",
+    "rheinland",
+    "saarland",
+    "thüringen",
+    "thueringen",
+    "sachsen",
+    "leipzig",
+    "düsseldorf",
+    "dusseldorf",
+    "köln",
+    "koeln",
+    "berlin",
+    "frankfurt",
+    "freiburg",
+    "augsburg",
+    "nürnberg",
+    "nuernberg",
 ]
 TARGET_PROFILE_DESCRIPTION = (
     "Fokus auf nicht-kommerzielle Maker:innen, Hackervereine, offene Werkstätten, Kultur-"
@@ -116,6 +182,65 @@ FALLBACK_SEED_CANDIDATES = [
     },
 ]
 MAX_FALLBACK_TARGET = len(FALLBACK_SEED_CANDIDATES)
+DIRECTORY_HINT_KEYWORDS = [
+    "liste",
+    "listen",
+    "übersicht",
+    "uebersicht",
+    "werkstätten",
+    "werkstaetten",
+    "labs",
+    "netzwerk",
+    "netzwerke",
+    "verzeichnis",
+    "guide",
+    "sammlung",
+    "aussteller",
+    "meet the makers",
+    "maker*innen",
+    "makerspaces",
+    "top ",
+    "top-",
+    "map",
+    "directory",
+    "diy-werkstätten",
+    "diy-werkstaetten",
+    "labs-werkstaetten",
+    "open labs",
+    "labore und werkstätten",
+]
+DIRECTORY_EXPANSION_MIN_SCORE = 0.5
+DIRECTORY_MAX_ENTRIES = 25
+DIRECTORY_MAX_DEPTH = 2
+REGIONAL_QUERY_PERMUTATIONS = [
+    "Makerspace Hamburg gemeinnützig",
+    "Offene Werkstatt Kiel Verein",
+    "Hackerspace Bremen e.V.",
+    "DIY Labor Lübeck",
+    "Kreativlabor Niedersachsen Schule",
+    "Open Lab Flensburg Universität",
+    "Freies Labor Schleswig-Holstein",
+    "Maker Kollektiv Rostock",
+    "Reparatur Café Norddeutschland",
+    "Community Werkstatt Mecklenburg",
+]
+DEFAULT_MAX_LETTERS = 3
+DEFAULT_PHASE = "acquire"
+DEFAULT_REGION = "nord"  # placeholder for macro areas
+
+
+def fallback_region_queries(used_queries: Iterable[str], missing: int, region: str = DEFAULT_REGION) -> List[str]:
+    pool = REGIONAL_QUERY_SETS.get(region.lower(), REGIONAL_QUERY_PERMUTATIONS)
+    remaining = max(1, min(len(pool), max(missing, 5)))
+    used = set(q.lower() for q in used_queries)
+    candidates: List[str] = []
+    for query in pool:
+        if query.lower() in used:
+            continue
+        candidates.append(query)
+        if len(candidates) >= remaining:
+            break
+    return candidates
 
 
 def web_search_tool_enabled() -> bool:
@@ -123,6 +248,133 @@ def web_search_tool_enabled() -> bool:
     return value not in {"0", "false", "no", "off"}
 
 
+def get_int_setting(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return default
+
+
+def get_letter_batch_limit() -> int:
+    return max(1, get_int_setting("MAX_LETTERS_PER_RUN", DEFAULT_MAX_LETTERS))
+
+
+def should_skip_url(url: str) -> bool:
+    lowered = url.lower()
+    if any(lowered.endswith(suffix) for suffix in NEGATIVE_URL_SUFFIXES):
+        return True
+    domain = urlparse(url).netloc.lower()
+    if any(domain.endswith(neg) for neg in NEGATIVE_DOMAINS):
+        return True
+    return False
+
+
+def candidate_matches_region(candidate: CandidateInfo, region: str) -> bool:
+    text = (_candidate_text(candidate) + " " + candidate.source_query).lower()
+    positives = NORD_REGION_KEYWORDS + REGION_POSITIVE_KEYWORDS.get(region.lower(), [])
+    if any(keyword in text for keyword in OFF_REGION_KEYWORDS):
+        return False
+    if any(keyword in text for keyword in positives):
+        return True
+    return True  # Unbekannt => nicht blockieren
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Recherche-Pipeline für Maker Faire Lübeck")
+    parser.add_argument(
+        "--phase",
+        choices=["explore", "refine", "acquire"],
+        default=os.environ.get("PIPELINE_PHASE", DEFAULT_PHASE),
+        help="Steuert Score-Schwellen, Query-Breite und Letter-Batching.",
+    )
+    parser.add_argument(
+        "--region",
+        default=os.environ.get("PIPELINE_REGION", DEFAULT_REGION),
+        help="Makroregion (z. B. nord, hamburg, luebeck, kiel, hannover).",
+    )
+    parser.add_argument(
+        "--max-iterations",
+        type=int,
+        default=os.environ.get("PIPELINE_MAX_ITERATIONS"),
+        help="Übersteuert die Anzahl Suchiteration (sonst Phase/env).")
+    parser.add_argument(
+        "--results-per-query",
+        type=int,
+        default=os.environ.get("PIPELINE_RESULTS_PER_QUERY"),
+        help="Übersteuert Trefferzahl pro Query (sonst Phase/env).",
+    )
+    parser.add_argument(
+        "--letters-per-run",
+        type=int,
+        default=os.environ.get("MAX_LETTERS_PER_RUN"),
+        help="Übersteuert Zahl der Anschreiben pro Lauf.",
+    )
+    return parser.parse_args()
+
+
+def phase_presets(phase: str) -> dict:
+    phase = phase.lower()
+    if phase == "explore":
+        return {
+            "accept_threshold": 0.55,
+            "max_iterations": 12,
+            "results_per_query": 12,
+            "letters_per_run": 1,
+        }
+    if phase == "refine":
+        return {
+            "accept_threshold": 0.65,
+            "max_iterations": 10,
+            "results_per_query": 10,
+            "letters_per_run": 2,
+        }
+    # acquire (default)
+    return {
+        "accept_threshold": 0.7,
+        "max_iterations": 8,
+        "results_per_query": 8,
+        "letters_per_run": 3,
+    }
+
+
+REGIONAL_QUERY_SETS = {
+    "nord": REGIONAL_QUERY_PERMUTATIONS,
+    "hamburg": [
+        "Makerspace Hamburg gemeinnützig",
+        "Open Lab Hamburg Hochschule",
+        "Hamburg DIY Kollektiv nicht kommerziell",
+        "Fab City Hamburg Werkstatt",
+    ],
+    "luebeck": [
+        "Lübeck offene Werkstatt",
+        "Maker Lübeck Verein",
+        "Lübeck Kulturtechnik Kollektiv",
+        "Offene Werkstatt Bad Schwartau",
+        "Gemeinschaftsprojekt Travemünde",
+        "Maker Ostholstein",
+    ],
+    "kiel": [
+        "Kiel Makerspace",
+        "Kiel Open Lab Schule",
+        "Kiel Hackerspace Verein",
+        "Offene Werkstatt Eckernförde",
+        "Rendsburg DIY Verein",
+    ],
+    "luebeck-local": [
+        "Lübeck Makerspace",
+        "Arfrade Hofprojekt",
+        "Bad Oldesloe offene Werkstatt",
+        "Reparatur Café Lübeck",
+        "Schwartau DIY", 
+        "Travemünde Maker",
+        "Neustadt in Holstein Werkstatt",
+    ],
+    "hannover": [
+        "Hannover Kreativlabor",
+        "Hackerspace Hannover",
+        "FabLab Hannover",
+    ],
+}
 @dataclass
 class PlannerPlan:
     steps: List[str]
@@ -160,6 +412,25 @@ class CandidateInfo:
         if self.northdata_info:
             base += f"- NorthData: {self.northdata_info}\n"
         return base
+
+
+def _candidate_text(candidate: CandidateInfo) -> str:
+    return " ".join(
+        filter(
+            None,
+            [
+                candidate.name,
+                candidate.summary,
+                candidate.snippet,
+                candidate.url,
+            ],
+        )
+    ).lower()
+
+
+def looks_like_directory_candidate(candidate: CandidateInfo) -> bool:
+    text = _candidate_text(candidate)
+    return any(keyword in text for keyword in DIRECTORY_HINT_KEYWORDS)
 
 
 @dataclass
@@ -340,6 +611,13 @@ def build_candidates_from_search(
     for item in results:
         if not item.url:
             continue
+        if should_skip_url(item.url):
+            append_log(
+                "search.filtered",
+                url=item.url,
+                reason="negative_source",
+            )
+            continue
         title = item.title or item.url
         summary = item.snippet or ""
         candidate = CandidateInfo(
@@ -368,6 +646,66 @@ def build_seed_candidates() -> List[CandidateInfo]:
     return candidates
 
 
+def candidate_from_directory_entry(
+    parent: CandidateInfo,
+    entry: DirectoryEntry,
+) -> CandidateInfo:
+    summary = entry.description or f"Automatisch aus {parent.name} übernommen."
+    return CandidateInfo(
+        name=entry.name.strip(),
+        url=entry.url.strip(),
+        summary=summary,
+        source_query=f"directory:{parent.url}",
+        snippet=summary,
+    )
+
+
+def candidate_score(candidate: CandidateInfo) -> float:
+    if candidate.evaluation:
+        return float(candidate.evaluation.score)
+    return 0.0
+
+
+def select_letter_candidates(
+    accepted: Sequence[CandidateInfo],
+    limit: int,
+) -> List[CandidateInfo]:
+    if not accepted or limit <= 0:
+        return []
+    ranked = sorted(accepted, key=candidate_score, reverse=True)
+    chosen: List[CandidateInfo] = []
+    seen_urls: set[str] = set()
+    for candidate in ranked:
+        if candidate.url in seen_urls:
+            continue
+        if looks_like_directory_candidate(candidate):
+            continue
+        chosen.append(candidate)
+        seen_urls.add(candidate.url)
+        if len(chosen) >= limit:
+            break
+    if not chosen:
+        for candidate in ranked:
+            if candidate.url in seen_urls:
+                continue
+            chosen.append(candidate)
+            seen_urls.add(candidate.url)
+            if len(chosen) >= limit:
+                break
+    return chosen
+
+
+def extend_plan_with_region(plan: PlannerPlan, region: str) -> None:
+    region_queries = REGIONAL_QUERY_SETS.get(region.lower())
+    if not region_queries:
+        return
+    existing = set(q.lower() for q in plan.search_queries)
+    additions = [q for q in region_queries if q.lower() not in existing]
+    if additions:
+        plan.search_queries.extend(additions)
+        console(f"Region '{region}' Queries hinzugefügt: {additions}")
+
+
 async def evaluate_candidate(
     model: OpenAIChatCompletionsModel,
     identity_summary: str,
@@ -380,6 +718,7 @@ async def evaluate_candidate(
             "Bewerte, ob ein Projekt/Organisation zu einer Maker Faire passt. "
             "Bevorzuge nicht-kommerzielle Kollektive, offene Werkstätten, Hackerspaces, "
             "Schul-/Uni-Teams und DIY-Kulturschaffende aus Norddeutschland. "
+            "Warnung: Reine Verzeichnisse/Sammelseiten (z. B. Listen, Übersichten, Guides) dürfen nicht akzeptiert werden; fordere stattdessen konkrete Gruppen mit eigener Kontaktmöglichkeit. "
             "Antworte ausschließlich als JSON mit Feldern:\n"
             '{"score": 0.0-1.0, "accepted": true/false, "reason": "...", "search_adjustment": "..."}\n'
             "score beschreibt die Passung (>=0.62 akzeptiert). "
@@ -430,10 +769,9 @@ async def refine_queries(
     feedback_hints: Sequence[str],
     used_queries: Iterable[str],
     missing: int,
+    region: str,
 ) -> List[str]:
     hints = [hint for hint in feedback_hints if hint]
-    if not hints:
-        return []
 
     agent = Agent(
         name="QueryRefiner",
@@ -454,7 +792,7 @@ async def refine_queries(
         + "\n".join(f"- {query}" for query in used_queries)
         + "\n\n"
         "Hinweise aus bisherigen Bewertungen:\n"
-        + ("\n".join(f"- {hint}" for hint in hints) if hints else "- keine")
+        + ("\n".join(f"- {hint}" for hint in hints) if hints else "- gezielt nach konkreten Vereinen/Offenen Werkstätten in Norddeutschland suchen")
         + "\n\n"
         f"Gesuchtes Profil:\n{TARGET_PROFILE_DESCRIPTION}\n\n"
         "Erzeuge maximal 5 neue Queries."
@@ -463,8 +801,11 @@ async def refine_queries(
     try:
         data = json.loads(extract_json_block(result.final_output or ""))
     except json.JSONDecodeError:
-        return []
-    queries = [q.strip() for q in data.get("new_queries", []) if isinstance(q, str) and q.strip()]
+        queries: List[str] = []
+    else:
+        queries = [q.strip() for q in data.get("new_queries", []) if isinstance(q, str) and q.strip()]
+    if not queries:
+        queries = fallback_region_queries(used_queries, missing, region)
     return queries
 
 
@@ -477,7 +818,12 @@ def enrich_with_northdata(candidates: Sequence[CandidateInfo]) -> None:
             candidate.northdata_info = f"NorthData-Fehler: {exc}"
             continue
 
-        store_suggestions(query, suggestions)
+        try:
+            store_suggestions(query, suggestions)
+        except OSError as exc:
+            append_log("northdata.store_error", query=query, error=str(exc))
+            candidate.northdata_info = f"NorthData nicht gespeichert ({exc})"
+            continue
         if suggestions:
             candidate.northdata_info = format_top_suggestion(suggestions)
         else:
@@ -561,11 +907,27 @@ def store_letter(
     return file_path
 
 
+def format_snapshot_for_prompt(snapshot: Optional[SiteSnapshot]) -> str:
+    if snapshot is None:
+        return ""
+    parts = [
+        f"- Titel: {snapshot.title.strip() or snapshot.url}",
+        f"- Zusammenfassung: {snapshot.summary.strip()}",
+    ]
+    if snapshot.detected_location:
+        parts.append(f"- Standort-Hinweis: {snapshot.detected_location}")
+    if snapshot.highlights:
+        highlight_lines = "\n".join(f"  * {text}" for text in snapshot.highlights)
+        parts.append("- Highlights:\n" + highlight_lines)
+    return "\n".join(parts)
+
+
 async def run_writer_agent(
     model: OpenAIChatCompletionsModel,
     identity_summary: str,
     candidate: CandidateInfo,
     feedback: str = "",
+    snapshot: Optional[SiteSnapshot] = None,
 ) -> str:
     console(f"Writer erstellt Entwurf fuer {candidate.name} ...")
     agent = Agent(
@@ -580,6 +942,8 @@ async def run_writer_agent(
         ),
         model=model,
     )
+    snapshot_context = format_snapshot_for_prompt(snapshot)
+
     prompt = (
         f"Identitaet:\n{identity_summary}\n\n"
         f"Gesuchtes Profil:\n{TARGET_PROFILE_DESCRIPTION}\n\n"
@@ -589,6 +953,11 @@ async def run_writer_agent(
         "Schreibe nun ein Einladungsschreiben (Markdown) mit persoenlicher Ansprache."
         "\nBetone explizit, dass der Stand fuer gemeinnuetzige und nicht-kommerzielle Teams kostenfrei ist."
     )
+    if snapshot_context:
+        prompt += (
+            "\n\nZusatzinfos aus der Webseitenanalyse:\n"
+            f"{snapshot_context}\n"
+        )
     if feedback:
         prompt += (
             "\n\nBeruecksichtige das folgende Feedback "
@@ -640,6 +1009,7 @@ async def generate_letter_with_guardrails(
     model: OpenAIChatCompletionsModel,
     identity_summary: str,
     candidate: CandidateInfo,
+    snapshot: Optional[SiteSnapshot] = None,
 ) -> QAResult:
     feedback = ""
     for attempt in range(1, MAX_QA_RETRIES + 1):
@@ -648,6 +1018,7 @@ async def generate_letter_with_guardrails(
             identity_summary=identity_summary,
             candidate=candidate,
             feedback=feedback,
+            snapshot=snapshot,
         )
         wc = word_count(letter)
         issues = []
@@ -686,6 +1057,11 @@ async def orchestrate_search(
     search_model: Optional[OpenAIResponsesModel],
     identity_summary: str,
     plan: PlannerPlan,
+    *,
+    max_iterations: int,
+    max_results_per_query: int,
+    region: str,
+    accept_threshold: float,
 ) -> tuple[List[CandidateInfo], List[CandidateInfo], str, int]:
     accepted: List[CandidateInfo] = []
     all_candidates: List[CandidateInfo] = []
@@ -705,11 +1081,98 @@ async def orchestrate_search(
     iteration = 0
     empty_searches = 0
     seeds_used = False
+    expanded_directories: set[str] = set()
 
-    while len(accepted) < plan.target_candidates and iteration < MAX_ITERATIONS and queries:
+    async def process_candidate(candidate: CandidateInfo, depth: int = 0) -> int:
+        """Evaluates a candidate and expands directory-style pages if useful."""
+        if candidate.url in seen_urls:
+            return 0
+        seen_urls.add(candidate.url)
+
+        if not candidate_matches_region(candidate, region):
+            reason = "Außerhalb Norddeutschland (Geo-Heuristik)."
+            evaluation = EvaluationResult(
+                score=0.15,
+                accepted=False,
+                reason=reason,
+                search_adjustment="Region Norddeutschland stärker einschränken",
+            )
+            candidate.evaluation = evaluation
+            candidate.notes = reason
+            all_candidates.append(candidate)
+            feedback_pool.append(evaluation.search_adjustment)
+            return 1
+
+        is_directory = looks_like_directory_candidate(candidate)
+
+        if is_directory:
+            evaluation = EvaluationResult(
+                score=0.4,
+                accepted=False,
+                reason="Sammelseite/Verzeichnis – wird zur Kandidatensuche genutzt und nicht direkt angeschrieben.",
+                search_adjustment="konkrete Organisation mit eigener Kontaktseite finden",
+            )
+        else:
+            evaluation = await evaluate_candidate(model, identity_summary, candidate)
+        candidate.evaluation = evaluation
+        candidate.notes = evaluation.reason
+        all_candidates.append(candidate)
+
+        processed = 1
+        if (
+            evaluation.accepted
+            and evaluation.score >= accept_threshold
+            and not is_directory
+            and len(accepted) < plan.target_candidates
+        ):
+            accepted.append(candidate)
+            console(f"Kandidat akzeptiert: {candidate.name}")
+        elif evaluation.search_adjustment:
+            feedback_pool.append(evaluation.search_adjustment)
+
+        should_expand = (
+            depth < DIRECTORY_MAX_DEPTH
+            and candidate.url not in expanded_directories
+            and (
+                is_directory
+                or (
+                    evaluation.score >= DIRECTORY_EXPANSION_MIN_SCORE
+                    and looks_like_directory_candidate(candidate)
+                )
+            )
+        )
+        if should_expand:
+            try:
+                entries = await asyncio.to_thread(
+                    expand_directory,
+                    candidate.url,
+                    max_entries=DIRECTORY_MAX_ENTRIES,
+                )
+            except DirectoryParserError as exc:
+                append_log("directory.error", source=candidate.url, error=str(exc))
+            else:
+                expanded_directories.add(candidate.url)
+                if entries:
+                    append_log(
+                        "directory.expand",
+                        source=candidate.url,
+                        count=len(entries),
+                    )
+                    console(
+                        f"Directory {candidate.name} lieferte {len(entries)} Untereintraege."
+                    )
+                    for entry in entries:
+                        derived_candidate = candidate_from_directory_entry(
+                            candidate,
+                            entry,
+                        )
+                        processed += await process_candidate(derived_candidate, depth + 1)
+        return processed
+
+    while len(accepted) < plan.target_candidates and iteration < max_iterations and queries:
         iteration += 1
         console(f"--- Suchiteration {iteration} mit {len(queries)} Queries ---")
-        new_candidates_in_iteration: List[CandidateInfo] = []
+        new_candidates_in_iteration = 0
 
         for query in queries:
             used_queries.append(query)
@@ -721,7 +1184,7 @@ async def orchestrate_search(
                     results = await run_web_search_agent(
                         search_model,
                         query=query,
-                        max_results=MAX_RESULTS_PER_QUERY,
+                        max_results=max_results_per_query,
                         location_hint=WEB_SEARCH_LOCATION,
                     )
                     backend_used = "web_tool"
@@ -738,7 +1201,7 @@ async def orchestrate_search(
                 results = await asyncio.to_thread(
                     search_fn,
                     query,
-                    max_results=MAX_RESULTS_PER_QUERY,
+                    max_results=max_results_per_query,
                 )
                 backend_used = backend_name
                 console(f"{backend_name} Suche fuer '{query}' gestartet ...")
@@ -778,19 +1241,8 @@ async def orchestrate_search(
 
             candidates = build_candidates_from_search(query, results)
             for candidate in candidates:
-                if candidate.url in seen_urls:
-                    continue
-                seen_urls.add(candidate.url)
-                evaluation = await evaluate_candidate(model, identity_summary, candidate)
-                candidate.evaluation = evaluation
-                candidate.notes = evaluation.reason
-                all_candidates.append(candidate)
-                new_candidates_in_iteration.append(candidate)
-                if evaluation.accepted and len(accepted) < plan.target_candidates:
-                    accepted.append(candidate)
-                    console(f"Kandidat akzeptiert: {candidate.name}")
-                else:
-                    feedback_pool.append(evaluation.search_adjustment)
+                processed = await process_candidate(candidate)
+                new_candidates_in_iteration += processed
 
         if len(accepted) >= plan.target_candidates:
             break
@@ -803,24 +1255,18 @@ async def orchestrate_search(
             feedback_hints=feedback_pool[-10:],  # letzte Hinweise reichen
             used_queries=used_queries,
             missing=remaining,
+            region=region,
         )
         queries = [q for q in iter_queries(new_queries) if q not in used_queries]
 
-        if not new_candidates_in_iteration and not queries:
+        if new_candidates_in_iteration == 0 and not queries:
             if not seeds_used:
                 console("Keine Treffer vom Backend – nutze lokale Seed-Kandidaten.")
                 seeds_used = True
                 seed_candidates = build_seed_candidates()
                 for candidate in seed_candidates:
-                    if candidate.url in seen_urls:
-                        continue
-                    seen_urls.add(candidate.url)
-                    evaluation = await evaluate_candidate(model, identity_summary, candidate)
-                    candidate.evaluation = evaluation
-                    candidate.notes = evaluation.reason
-                    all_candidates.append(candidate)
-                    if evaluation.accepted and len(accepted) < plan.target_candidates:
-                        accepted.append(candidate)
+                    processed = await process_candidate(candidate)
+                    new_candidates_in_iteration += processed
                 continue
             console("Keine neuen Kandidaten gefunden, Abbruch.")
             break
@@ -829,6 +1275,8 @@ async def orchestrate_search(
 
 
 async def async_main() -> None:
+    args = parse_args()
+    presets = phase_presets(args.phase)
     ensure_dirs()
     load_env_file(ENV_PATH)
     ensure_required_env(["OPENAI_BASE_URL", "OPENAI_MODEL"])
@@ -837,6 +1285,34 @@ async def async_main() -> None:
     identity_summary = get_identity_summary(identity)
 
     chat_model, search_model = build_models()
+    max_iterations = args.max_iterations
+    if max_iterations is None:
+        max_iterations = get_int_setting("PIPELINE_MAX_ITERATIONS", presets["max_iterations"])
+    max_iterations = max(3, int(max_iterations))
+
+    max_results_per_query = args.results_per_query
+    if max_results_per_query is None:
+        max_results_per_query = get_int_setting(
+            "PIPELINE_RESULTS_PER_QUERY", presets["results_per_query"]
+        )
+    max_results_per_query = max(3, int(max_results_per_query))
+
+    letters_per_run = args.letters_per_run
+    if letters_per_run is None:
+        letters_per_run = get_int_setting("MAX_LETTERS_PER_RUN", presets["letters_per_run"])
+    os.environ["MAX_LETTERS_PER_RUN"] = str(letters_per_run)
+
+    console(
+        f"Phase: {args.phase} | Region: {args.region} | Iterationen: {max_iterations} | Treffer/Query: {max_results_per_query} | Briefe/Lauf: {letters_per_run}"
+    )
+    append_log(
+        "pipeline.config",
+        phase=args.phase,
+        region=args.region,
+        max_iterations=max_iterations,
+        results_per_query=max_results_per_query,
+        letters_per_run=letters_per_run,
+    )
 
     task = (
         "Finde mindestens 50 nicht-kommerzielle Maker:innen, Vereine oder Kollektive "
@@ -845,6 +1321,7 @@ async def async_main() -> None:
     )
     append_log("pipeline.start", task=task)
     plan, planner_raw = await run_planner(chat_model, task, identity_summary)
+    extend_plan_with_region(plan, args.region)
     console("Plan-Schritte:")
     for step in plan.steps:
         console(f"- {step}")
@@ -864,8 +1341,17 @@ async def async_main() -> None:
             target=plan.target_candidates,
         )
 
+    accept_threshold = presets["accept_threshold"]
+
     accepted, all_candidates, backend_name, empty_searches = await orchestrate_search(
-        chat_model, search_model, identity_summary, plan
+        chat_model,
+        search_model,
+        identity_summary,
+        plan,
+        max_iterations=max_iterations,
+        max_results_per_query=max_results_per_query,
+        region=args.region,
+        accept_threshold=accept_threshold,
     )
     if not accepted:
         hint = ""
@@ -897,17 +1383,45 @@ async def async_main() -> None:
     store_research_notes(plan, planner_raw, accepted, rejected)
     console(f"Recherche-Notizen gespeichert: {STAGING_NOTES}")
 
-    top_candidate = accepted[0]
-    qa_result = await generate_letter_with_guardrails(chat_model, identity_summary, top_candidate)
-    letter_path = store_letter(top_candidate, qa_result.letter, qa_notes=qa_result.notes)
-    append_log(
-        "letter.saved",
-        candidate=top_candidate.name,
-        path=str(letter_path),
-        qa_notes=qa_result.notes,
-    )
-    console(f"Anschreiben gespeichert unter: {letter_path}")
-    append_log("pipeline.done", accepted=len(accepted), letter=str(letter_path))
+    if len(accepted) < plan.target_candidates:
+        missing = plan.target_candidates - len(accepted)
+        warning_msg = (
+            f"Warnung: Ziel von {plan.target_candidates} Kandidaten nicht erreicht (Fehlen {missing})."
+        )
+        console(warning_msg)
+        append_log(
+            "search.target_shortfall",
+            target=plan.target_candidates,
+            actual=len(accepted),
+            missing=missing,
+        )
+
+    letter_limit = get_letter_batch_limit()
+    letter_candidates = select_letter_candidates(accepted, letter_limit)
+    letters_written = 0
+    if not letter_candidates:
+        console("Keine passenden Kandidaten für Anschreiben gefunden.")
+    else:
+        for candidate in letter_candidates:
+            snapshot = await asyncio.to_thread(fetch_site_snapshot, candidate.url)
+            qa_result = await generate_letter_with_guardrails(
+                chat_model,
+                identity_summary,
+                candidate,
+                snapshot=snapshot,
+            )
+            letter_path = store_letter(candidate, qa_result.letter, qa_notes=qa_result.notes)
+            append_log(
+                "letter.saved",
+                candidate=candidate.name,
+                path=str(letter_path),
+                qa_notes=qa_result.notes,
+            )
+            console(f"Anschreiben gespeichert unter: {letter_path}")
+            letters_written += 1
+            if letters_written >= letter_limit:
+                break
+    append_log("pipeline.done", accepted=len(accepted), letters=letters_written)
 
 
 if __name__ == "__main__":
@@ -916,3 +1430,4 @@ if __name__ == "__main__":
     except Exception as exc:  # pragma: no cover
         append_log("pipeline.failed", error=str(exc))
         raise
+import argparse
