@@ -20,10 +20,11 @@ import asyncio
 import json
 import os
 import re
+from collections import Counter
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable, Iterable, List, Optional, Sequence, Protocol, Tuple
+from typing import Callable, Iterable, List, Optional, Sequence, Protocol, Tuple, Mapping
 from urllib.parse import urlparse
 
 from agents import Agent, Runner
@@ -98,6 +99,36 @@ NEGATIVE_DOMAINS = {
     "bne-portal.de",
     "schleswig-holstein.de",
 }
+NEGATIVE_TEXT_TERMS = [
+    "outlet",
+    "shopping center",
+    "shopping-centre",
+    "bank",
+    "sparkasse",
+    "versicher",
+    "immobilien",
+    "wohnungsbau",
+    "stiftung",
+    "gmbh",
+    "aktiengesellschaft",
+    "investment",
+    "einkaufszentrum",
+]
+SEARCH_FOCUS_KEYWORDS = [
+    "verein",
+    "e.v.",
+    "makerspace",
+    "hackerspace",
+    "labor",
+    "offene werkstatt",
+    "repair café",
+    "repair cafe",
+    "gemeinnützig",
+    "gemeinnuetzig",
+    "open lab",
+    "fablab",
+    "maker",
+]
 NORD_REGION_KEYWORDS = [
     "norddeutsch",
     "schleswig",
@@ -156,34 +187,6 @@ TARGET_PROFILE_DESCRIPTION = (
     "Bevorzugt Projekte mit Mitmach-Charakter, Bildungsschwerpunkt oder DIY-Kultur."
 )
 WEB_SEARCH_LOCATION = "Norddeutschland (Lübeck, Hamburg, Kiel, Bremen)"
-FALLBACK_SEED_CANDIDATES = [
-    {
-        "name": "Chaotikum e.V.",
-        "url": "https://chaotikum.org",
-        "summary": "Hackspace und Kulturverein in Lübeck, bietet offene Werkstatt, Workshops und DIY-Projekte.",
-    },
-    {
-        "name": "Der Fuchsbau",
-        "url": "https://fuchsbau-luebeck.de",
-        "summary": "Sozio-kulturelles Zentrum und Bastelkollektiv aus Lübeck, Fokus auf Kunst, Technik und Bildung.",
-    },
-    {
-        "name": "Freies Labor Kiel",
-        "url": "https://freieslabor.org",
-        "summary": "Gemeinnütziger Makerspace in Kiel mit Schwerpunkt auf Bildung, Reparatur und offenen Technologien.",
-    },
-    {
-        "name": "Hackerspace Bremen e.V.",
-        "url": "https://www.hackerspace-bremen.de",
-        "summary": "Offener Raum für Technik- und Bastelprojekte, workshops und non-kommerzielle Maker-Events.",
-    },
-    {
-        "name": "Chaostreff Flensburg",
-        "url": "https://chaostreff-flensburg.de",
-        "summary": "Community für IT, Elektronik und kreative Projekte im Raum Flensburg.",
-    },
-]
-MAX_FALLBACK_TARGET = len(FALLBACK_SEED_CANDIDATES)
 DIRECTORY_HINT_KEYWORDS = [
     "liste",
     "listen",
@@ -257,10 +260,6 @@ def get_int_setting(name: str, default: int) -> int:
         return default
 
 
-def get_letter_batch_limit() -> int:
-    return max(1, get_int_setting("MAX_LETTERS_PER_RUN", DEFAULT_MAX_LETTERS))
-
-
 def should_skip_url(url: str) -> bool:
     lowered = url.lower()
     if any(lowered.endswith(suffix) for suffix in NEGATIVE_URL_SUFFIXES):
@@ -312,12 +311,28 @@ def parse_args() -> argparse.Namespace:
         help="Übersteuert Zahl der Anschreiben pro Lauf.",
     )
     parser.add_argument(
+        "--target-candidates",
+        type=int,
+        default=os.environ.get("PIPELINE_TARGET_CANDIDATES"),
+        help="Zielgröße akzeptierter Kandidaten (Standard: Planner / Briefe).",
+    )
+    parser.add_argument(
         "--resume-candidates",
         nargs="?",
         const=str(STAGING_ACCEPTED),
         help="Überspringt die Websuche und lädt akzeptierte Kandidaten aus der angegebenen Snapshot-Datei (Standard: data/staging/candidates_selected.json).",
     )
     return parser.parse_args()
+
+
+def normalize_resume_path(value: Optional[str]) -> Optional[Path]:
+    if value is None:
+        return None
+    candidate = (value or "").strip().strip('"').strip("'")
+    if candidate in {"", "="}:
+        candidate = str(STAGING_ACCEPTED)
+    path = Path(candidate)
+    return path
 
 
 def phase_presets(phase: str) -> dict:
@@ -396,6 +411,11 @@ class EvaluationResult:
     accepted: bool
     reason: str
     search_adjustment: str
+    category: str = ""
+    region_hint: str = ""
+    nonprofit: bool = False
+    maker_focus: bool = False
+    outreach_priority: float = 0.0
 
 
 @dataclass
@@ -422,6 +442,8 @@ class CandidateInfo:
     context: Optional["CandidateContext"] = field(default=None, repr=False)
     org_slug: str = ""
     duplicate_reason: str = ""
+    letter_status: str = "pending"
+    letter_path: str = ""
 
     def as_markdown(self) -> str:
         base = (
@@ -673,6 +695,14 @@ def build_candidates_from_search(
             )
             continue
         title = item.title or item.url
+        combined_text = f"{title} {item.snippet}".lower()
+        if any(term in combined_text for term in NEGATIVE_TEXT_TERMS):
+            append_log(
+                "search.filtered",
+                url=item.url,
+                reason="negative_text",
+            )
+            continue
         summary = item.snippet or ""
         candidate = CandidateInfo(
             name=title.strip(),
@@ -737,21 +767,6 @@ async def filter_search_results(
     return [results[idx] for idx in keep]
 
 
-def build_seed_candidates() -> List[CandidateInfo]:
-    candidates: List[CandidateInfo] = []
-    for seed in FALLBACK_SEED_CANDIDATES:
-        candidates.append(
-            CandidateInfo(
-                name=seed["name"],
-                url=seed["url"],
-                summary=seed["summary"],
-                source_query="fallback:seed",
-                snippet=seed["summary"],
-            )
-        )
-    return candidates
-
-
 def candidate_from_directory_entry(
     parent: CandidateInfo,
     entry: DirectoryEntry,
@@ -767,9 +782,16 @@ def candidate_from_directory_entry(
 
 
 def candidate_score(candidate: CandidateInfo) -> float:
-    if candidate.evaluation:
-        return float(candidate.evaluation.score)
-    return 0.0
+    if not candidate.evaluation:
+        return 0.0
+    base = float(candidate.evaluation.score)
+    if candidate.evaluation.outreach_priority:
+        base += 0.1 * float(candidate.evaluation.outreach_priority)
+    if candidate.evaluation.maker_focus:
+        base += 0.05
+    if candidate.evaluation.nonprofit:
+        base += 0.05
+    return base
 
 
 def select_letter_candidates(
@@ -801,6 +823,95 @@ def select_letter_candidates(
     return chosen
 
 
+def summarize_candidates_for_prompt(
+    candidates: Sequence[CandidateInfo], limit: int = 5
+) -> str:
+    if not candidates:
+        return "- Noch keine akzeptierten Kandidaten."
+    lines: List[str] = []
+    for candidate in candidates[-limit:]:
+        location = ""
+        if (
+            candidate.context
+            and candidate.context.primary
+            and candidate.context.primary.detected_location
+        ):
+            location = candidate.context.primary.detected_location
+        summary = candidate.summary or ""
+        if not summary and candidate.context and candidate.context.primary:
+            summary = candidate.context.primary.summary
+        snippet = (summary or candidate.snippet or "").strip()
+        if len(snippet) > 160:
+            snippet = snippet[:157] + "..."
+        lines.append(
+            f"- {candidate.name} ({location or 'Region offen'}) – {snippet or 'Keine Kurzbeschreibung'}"
+        )
+    return "\n".join(lines)
+
+
+def candidate_from_direct_hint(hint: Mapping[str, object]) -> Optional[CandidateInfo]:
+    url = str(hint.get("url") or "").strip()
+    if not url:
+        return None
+    name = str(hint.get("name") or hint.get("title") or url).strip()
+    summary = str(hint.get("summary") or hint.get("description") or "").strip()
+    text = summary or "Direkter Crawl-Hinweis vom Query-Refiner."
+    return CandidateInfo(
+        name=name or url,
+        url=url,
+        summary=text,
+        source_query="refiner:direct",
+        snippet=summary,
+    )
+
+
+def summarize_run(plan: PlannerPlan, accepted: Sequence[CandidateInfo], all_candidates: Sequence[CandidateInfo], letter_stats: dict[str, int]) -> None:
+    total = len(all_candidates)
+    accepted_count = len(accepted)
+    letters_done = letter_stats.get("completed", 0)
+    scheduled = letter_stats.get("scheduled", 0)
+    failed = letter_stats.get("failed", 0)
+    queued = max(0, scheduled - letters_done - failed)
+    pending = max(0, accepted_count - letters_done - failed)
+    rejection_counter = Counter(
+        (c.evaluation.category if c.evaluation else "unbekannt")
+        for c in all_candidates
+        if not (c.evaluation and c.evaluation.accepted)
+    )
+    console("=== Laufzusammenfassung ===")
+    console(
+        f"Kandidaten gesamt: {total} | akzeptiert: {accepted_count}/{plan.target_candidates} | Briefe abgeschlossen: {letters_done}"
+    )
+    console(
+        f"Warteschlange Briefe: queued={queued} pending={pending} failed={failed}"
+    )
+    if rejection_counter:
+        top_rejections = ", ".join(
+            f"{cat}: {count}" for cat, count in rejection_counter.most_common(4)
+        )
+        console(f"Top Ablehnungsgründe: {top_rejections}")
+    highlight_lines = []
+    for candidate in accepted[:5]:
+        status = candidate.letter_status or "pending"
+        score = candidate.evaluation.score if candidate.evaluation else 0.0
+        highlight_lines.append(
+            f"- {candidate.name} ({status}, Score {score:.2f})"
+        )
+    if highlight_lines:
+        console("Akzeptiert & Status:\n" + "\n".join(highlight_lines))
+    append_log(
+        "pipeline.summary",
+        total_candidates=total,
+        accepted=accepted_count,
+        target=plan.target_candidates,
+        letters_done=letters_done,
+        queued=queued,
+        pending=pending,
+        failed=failed,
+        top_rejections=rejection_counter.most_common(6),
+    )
+
+
 def load_candidates_from_snapshot(path: Path) -> List[CandidateInfo]:
     if not path.exists():
         raise FileNotFoundError(f"Snapshot {path} nicht gefunden.")
@@ -826,6 +937,8 @@ def load_candidates_from_snapshot(path: Path) -> List[CandidateInfo]:
             notes=entry.get("notes", ""),
             northdata_info=entry.get("northdata_info", ""),
             org_slug=entry.get("org_slug", ""),
+            letter_status=entry.get("letter_status", "pending"),
+            letter_path=entry.get("letter_path", ""),
         )
         candidate.evaluation = evaluation
         candidates.append(candidate)
@@ -843,6 +956,17 @@ def extend_plan_with_region(plan: PlannerPlan, region: str) -> None:
         console(f"Region '{region}' Queries hinzugefügt: {additions}")
 
 
+def enforce_focus_keywords(queries: Sequence[str]) -> List[str]:
+    normalized: List[str] = []
+    for query in queries:
+        lowered = query.lower()
+        if any(keyword in lowered for keyword in SEARCH_FOCUS_KEYWORDS):
+            normalized.append(query)
+        else:
+            normalized.append(f"{query} Makerspace Verein")
+    return normalized
+
+
 async def evaluate_candidate(
     model: OpenAIChatCompletionsModel,
     identity_summary: str,
@@ -858,7 +982,9 @@ async def evaluate_candidate(
             "Schul-/Uni-Teams und DIY-Kulturschaffende aus Norddeutschland. "
             "Warnung: Reine Verzeichnisse/Sammelseiten (z. B. Listen, Übersichten, Guides) dürfen nicht akzeptiert werden; fordere stattdessen konkrete Gruppen mit eigener Kontaktmöglichkeit. "
             "Antworte ausschließlich als JSON mit Feldern:\n"
-            '{"score": 0.0-1.0, "accepted": true/false, "reason": "...", "search_adjustment": "..."}\n'
+            '{"score": 0.0-1.0, "accepted": true/false, "reason": "...", "search_adjustment": "...", '
+            '"category": "verein|schule|directory|kommerziell|event|sonstiges", '
+            '"region_hint": "...", "nonprofit": true/false, "maker_focus": true/false, "outreach_priority": 0.0-1.0}\n'
             "score beschreibt die Passung (>=0.62 akzeptiert). "
             '"search_adjustment" enthält einen Hinweis, wie künftige Queries präzisiert werden können '
             "(z. B. \"mehr Bildungspartner\" oder \"weniger reine Händler\"). "
@@ -886,7 +1012,17 @@ async def evaluate_candidate(
     try:
         data = json.loads(output)
     except json.JSONDecodeError:
-        data = {"score": 0.0, "accepted": False, "reason": "Bewertung fehlgeschlagen.", "search_adjustment": "präzisere Suchbegriffe verwenden"}
+        data = {
+            "score": 0.0,
+            "accepted": False,
+            "reason": "Bewertung fehlgeschlagen.",
+            "search_adjustment": "präzisere Suchbegriffe verwenden",
+            "category": "unbekannt",
+            "region_hint": "",
+            "nonprofit": False,
+            "maker_focus": False,
+            "outreach_priority": 0.0,
+        }
 
     score = float(data.get("score", 0.0))
     accepted = bool(data.get("accepted", score >= EVALUATION_ACCEPT_THRESHOLD))
@@ -900,6 +1036,11 @@ async def evaluate_candidate(
         accepted=accepted,
         reason=reason,
         search_adjustment=adjustment,
+        category=str(data.get("category", "")).strip(),
+        region_hint=str(data.get("region_hint", "")).strip(),
+        nonprofit=bool(data.get("nonprofit", False)),
+        maker_focus=bool(data.get("maker_focus", False)),
+        outreach_priority=float(data.get("outreach_priority", 0.0) or 0.0),
     )
 
 
@@ -1046,15 +1187,20 @@ async def refine_queries(
     used_queries: Iterable[str],
     missing: int,
     region: str,
-) -> List[str]:
+    recent_accepts: Sequence[CandidateInfo],
+) -> tuple[List[str], List[CandidateInfo]]:
     hints = [hint for hint in feedback_hints if hint]
+    accepted_block = summarize_candidates_for_prompt(recent_accepts)
 
     agent = Agent(
         name="QueryRefiner",
         instructions=(
             "Erzeuge neue Suchqueries (Google Custom Search oder DuckDuckGo) für non-kommerzielle Maker:innen, "
             "Hackspaces, offene Werkstätten, DIY-Kollektive und ähnliche Gruppen. "
-            "Antworte ausschließlich im JSON-Format: {\"new_queries\": [\"...\"]}. "
+            "Nutze außerdem direkte Webseiten-Hinweise: Wenn du konkrete Vereine oder URLs kennst, füge sie unter "
+            "\"direct_urls\" ein, dann crawlt das System diese Seiten direkt ohne Websuche. "
+            "Antworte ausschließlich im JSON-Format: "
+            '{"new_queries": ["..."], "direct_urls": [{"name": "...", "url": "...", "summary": "..."}]}. '
             "Meide bereits verwendete Queries und fokussiere dich auf die Hinweise."
         ),
         model=model,
@@ -1070,19 +1216,28 @@ async def refine_queries(
         "Hinweise aus bisherigen Bewertungen:\n"
         + ("\n".join(f"- {hint}" for hint in hints) if hints else "- gezielt nach konkreten Vereinen/Offenen Werkstätten in Norddeutschland suchen")
         + "\n\n"
+        "Bereits akzeptierte Kandidaten (verwende Themen/Ortsangaben als Inspiration für neue Suchbegriffe oder Direktlinks):\n"
+        f"{accepted_block}\n\n"
         f"Gesuchtes Profil:\n{TARGET_PROFILE_DESCRIPTION}\n\n"
-        "Erzeuge maximal 5 neue Queries."
+        "Erzeuge maximal 5 neue Queries und gib bei bekannten URLs (inkl. kurzer Zusammenfassung) Einträge in direct_urls zurück."
     )
     result = await Runner.run(agent, prompt)
     try:
         data = json.loads(extract_json_block(result.final_output or ""))
     except json.JSONDecodeError:
-        queries: List[str] = []
+        queries = []
+        direct_urls: List[CandidateInfo] = []
     else:
         queries = [q.strip() for q in data.get("new_queries", []) if isinstance(q, str) and q.strip()]
+        direct_urls = []
+        for entry in data.get("direct_urls", []) or []:
+            if isinstance(entry, Mapping):
+                candidate = candidate_from_direct_hint(entry)
+                if candidate:
+                    direct_urls.append(candidate)
     if not queries:
         queries = fallback_region_queries(used_queries, missing, region)
-    return queries
+    return queries, direct_urls
 
 
 def enrich_with_northdata(candidates: Sequence[CandidateInfo]) -> None:
@@ -1092,6 +1247,10 @@ def enrich_with_northdata(candidates: Sequence[CandidateInfo]) -> None:
             suggestions = fetch_suggestions(query, countries=NORTHDATA_COUNTRIES)
         except NorthDataError as exc:
             candidate.northdata_info = f"NorthData-Fehler: {exc}"
+            continue
+        except Exception as exc:  # pragma: no cover - Netzwerkzeitüberschreitungen u.ä.
+            append_log("northdata.fetch_error", query=query, error=str(exc))
+            candidate.northdata_info = f"NorthData-Timeout/Fehler: {exc}"
             continue
 
         try:
@@ -1151,17 +1310,16 @@ def store_research_notes(plan: PlannerPlan, planner_raw: str, accepted: Sequence
 
 
 def slugify(value: str) -> str:
-    return (
+    normalized = (
         value.lower()
-        .replace(" ", "-")
-        .replace("/", "-")
-        .replace("_", "-")
         .replace("ä", "ae")
         .replace("ö", "oe")
         .replace("ü", "ue")
         .replace("ß", "ss")
-        .strip("-")
     )
+    normalized = re.sub(r"[^a-z0-9-]+", "-", normalized)
+    normalized = re.sub(r"-{2,}", "-", normalized).strip("-")
+    return normalized or "candidate"
 
 
 def store_letter(
@@ -1350,6 +1508,106 @@ async def generate_letter_with_guardrails(
     raise RuntimeError("QA konnte das Anschreiben nicht freigeben.")
 
 
+class LetterDispatcher:
+    """Schedules letter generation tasks as soon as candidates are akzeptiert."""
+
+    def __init__(
+        self,
+        *,
+        limit: int,
+        model: OpenAIChatCompletionsModel,
+        identity_summary: str,
+        blacklist: BlacklistManager,
+        org_registry: OrganizationRegistry,
+    ) -> None:
+        self.limit = max(0, limit)
+        self.model = model
+        self.identity_summary = identity_summary
+        self.blacklist = blacklist
+        self.org_registry = org_registry
+        self._lock = asyncio.Lock()
+        self._scheduled = 0
+        self._completed = 0
+        self._failed = 0
+        self._tasks: set[asyncio.Task] = set()
+
+    async def enqueue(self, candidate: CandidateInfo) -> bool:
+        if self.limit == 0:
+            return False
+        async with self._lock:
+            if self._scheduled >= self.limit:
+                return False
+            self._scheduled += 1
+            candidate.letter_status = "queued"
+        console(f"LetterDispatcher: starte Anschreiben für {candidate.name}.")
+        task = asyncio.create_task(self._process_candidate(candidate))
+        self._tasks.add(task)
+        task.add_done_callback(lambda t: self._tasks.discard(t))
+        return True
+
+    async def _process_candidate(self, candidate: CandidateInfo) -> None:
+        try:
+            context = candidate.context
+            snapshot = context.primary if context else None
+            if snapshot is None:
+                snapshot = await asyncio.to_thread(fetch_site_snapshot, candidate.url)
+            qa_result = await generate_letter_with_guardrails(
+                self.model,
+                self.identity_summary,
+                candidate,
+                snapshot=snapshot,
+                context=context,
+            )
+            letter_path = store_letter(
+                candidate, qa_result.letter, qa_notes=qa_result.notes
+            )
+            append_log(
+                "letter.saved",
+                candidate=candidate.name,
+                path=str(letter_path),
+                qa_notes=qa_result.notes,
+            )
+            console(f"Anschreiben gespeichert unter: {letter_path}")
+            candidate.letter_status = "sent"
+            candidate.letter_path = str(letter_path)
+            if candidate.org_slug:
+                self.org_registry.mark_status(candidate.org_slug, "contacted")
+            self.blacklist.add(
+                candidate.url,
+                reason="Bereits angeschrieben (Einladung gesendet).",
+                tag="contacted",
+                meta={"letter_path": str(letter_path)},
+            )
+            append_log(
+                "blacklist.add",
+                url=candidate.url,
+                reason="Bereits angeschrieben",
+                tag="contacted",
+            )
+            async with self._lock:
+                self._completed += 1
+        except Exception as exc:  # pragma: no cover - defensive logging
+            append_log("letter.error", candidate=candidate.name, error=str(exc))
+            console(f"[WARN] Anschreiben für {candidate.name} fehlgeschlagen: {exc}")
+            candidate.letter_status = "failed"
+            async with self._lock:
+                self._failed += 1
+
+    def stats(self) -> dict[str, int]:
+        return {
+            "scheduled": self._scheduled,
+            "completed": self._completed,
+            "failed": self._failed,
+        }
+
+    async def finalize(self) -> dict[str, int]:
+        tasks = list(self._tasks)
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        async with self._lock:
+            return self.stats()
+
+
 async def orchestrate_search(
     model: OpenAIChatCompletionsModel,
     search_model: Optional[OpenAIResponsesModel],
@@ -1362,6 +1620,7 @@ async def orchestrate_search(
     max_results_per_query: int,
     region: str,
     accept_threshold: float,
+    letter_dispatcher: Optional[LetterDispatcher] = None,
 ) -> tuple[List[CandidateInfo], List[CandidateInfo], str, int]:
     accepted: List[CandidateInfo] = []
     all_candidates: List[CandidateInfo] = []
@@ -1381,7 +1640,6 @@ async def orchestrate_search(
     queries = list(iter_queries(plan.search_queries))
     iteration = 0
     empty_searches = 0
-    seeds_used = False
     expanded_directories: set[str] = set()
 
     search_failed = False
@@ -1543,6 +1801,8 @@ async def orchestrate_search(
             console(f"Kandidat akzeptiert: {candidate.name}")
             if candidate.org_slug:
                 org_registry.mark_status(candidate.org_slug, "accepted")
+            if letter_dispatcher:
+                await letter_dispatcher.enqueue(candidate)
         elif evaluation.search_adjustment:
             feedback_pool.append(evaluation.search_adjustment)
 
@@ -1682,7 +1942,8 @@ async def orchestrate_search(
             break
 
         remaining = plan.target_candidates - len(accepted)
-        new_queries = await refine_queries(
+        recent_accepts = accepted[-5:]
+        new_queries, direct_candidates = await refine_queries(
             model=model,
             identity_summary=identity_summary,
             base_task="Finde nicht-kommerzielle Maker-Kollektive fuer die Maker Faire Lübeck.",
@@ -1690,18 +1951,14 @@ async def orchestrate_search(
             used_queries=used_queries,
             missing=remaining,
             region=region,
+            recent_accepts=recent_accepts,
         )
+        for direct_candidate in direct_candidates:
+            processed = await process_candidate(direct_candidate)
+            new_candidates_in_iteration += processed
         queries = [q for q in iter_queries(new_queries) if q not in used_queries]
 
         if new_candidates_in_iteration == 0 and not queries:
-            if not seeds_used:
-                console("Keine Treffer vom Backend – nutze lokale Seed-Kandidaten.")
-                seeds_used = True
-                seed_candidates = build_seed_candidates()
-                for candidate in seed_candidates:
-                    processed = await process_candidate(candidate)
-                    new_candidates_in_iteration += processed
-                continue
             console("Keine neuen Kandidaten gefunden, Abbruch.")
             break
 
@@ -1731,21 +1988,18 @@ async def async_main() -> None:
         )
     max_results_per_query = max(3, int(max_results_per_query))
 
-    letters_per_run = args.letters_per_run
-    if letters_per_run is None:
-        letters_per_run = get_int_setting("MAX_LETTERS_PER_RUN", presets["letters_per_run"])
-    os.environ["MAX_LETTERS_PER_RUN"] = str(letters_per_run)
-
+    requested_letters = args.letters_per_run
+    if requested_letters is None:
+        requested_letters = get_int_setting("MAX_LETTERS_PER_RUN", DEFAULT_MAX_LETTERS)
+    requested_letters = max(0, int(requested_letters))
+    target_override = args.target_candidates
+    if target_override is not None:
+        try:
+            target_override = int(target_override)
+        except (TypeError, ValueError):
+            target_override = None
     console(
-        f"Phase: {args.phase} | Region: {args.region} | Iterationen: {max_iterations} | Treffer/Query: {max_results_per_query} | Briefe/Lauf: {letters_per_run}"
-    )
-    append_log(
-        "pipeline.config",
-        phase=args.phase,
-        region=args.region,
-        max_iterations=max_iterations,
-        results_per_query=max_results_per_query,
-        letters_per_run=letters_per_run,
+        f"Phase: {args.phase} | Region: {args.region} | Iterationen: {max_iterations} | Treffer/Query: {max_results_per_query} | Briefe-Wunsch: {requested_letters}"
     )
 
     task = (
@@ -1756,6 +2010,15 @@ async def async_main() -> None:
     append_log("pipeline.start", task=task)
     plan, planner_raw = await run_planner(chat_model, task, identity_summary)
     extend_plan_with_region(plan, args.region)
+    plan.search_queries = enforce_focus_keywords(plan.search_queries)
+    if target_override is None:
+        target_override = requested_letters or plan.target_candidates or DEFAULT_TARGET_CANDIDATES
+    final_target = max(1, int(target_override))
+    if requested_letters:
+        final_target = max(final_target, requested_letters)
+    plan.target_candidates = final_target
+    os.environ["MAX_LETTERS_PER_RUN"] = str(plan.target_candidates)
+    console(f"Kandidaten-Ziel gesetzt auf {plan.target_candidates} (Briefe 1:1).")
     console("Plan-Schritte:")
     for step in plan.steps:
         console(f"- {step}")
@@ -1766,6 +2029,16 @@ async def async_main() -> None:
         queries=len(plan.search_queries),
         target=plan.target_candidates,
     )
+    append_log(
+        "pipeline.config",
+        phase=args.phase,
+        region=args.region,
+        max_iterations=max_iterations,
+        results_per_query=max_results_per_query,
+        letters_per_run=plan.target_candidates,
+        requested_letters=requested_letters,
+        target_candidates=plan.target_candidates,
+    )
 
     blacklist = BlacklistManager()
     console(f"Geladene Blacklist-Eintraege: {len(blacklist)}")
@@ -1773,20 +2046,19 @@ async def async_main() -> None:
     org_registry = OrganizationRegistry()
     console(f"Geladene Organisations-Registry: {len(org_registry)}")
     append_log("registry.loaded", entries=len(org_registry))
-
-    if search_model is None and not has_google_config() and plan.target_candidates > MAX_FALLBACK_TARGET:
-        plan.target_candidates = MAX_FALLBACK_TARGET
-        append_log(
-            "planner.adjust_target",
-            reason="no_google_config",
-            target=plan.target_candidates,
-        )
+    letter_dispatcher = LetterDispatcher(
+        limit=plan.target_candidates,
+        model=chat_model,
+        identity_summary=identity_summary,
+        blacklist=blacklist,
+        org_registry=org_registry,
+    )
 
     accept_threshold = presets["accept_threshold"]
 
     resume_candidates: Optional[List[CandidateInfo]] = None
-    if args.resume_candidates:
-        resume_path = Path(args.resume_candidates)
+    resume_path = normalize_resume_path(args.resume_candidates)
+    if resume_path:
         resume_candidates = load_candidates_from_snapshot(resume_path)
         if not resume_candidates:
             raise RuntimeError(f"Snapshot {resume_path} enthält keine akzeptierten Kandidaten.")
@@ -1812,6 +2084,8 @@ async def async_main() -> None:
                 status="accepted",
                 notes="Resume-Modus",
             )
+        for candidate in accepted:
+            await letter_dispatcher.enqueue(candidate)
     else:
         accepted, all_candidates, backend_name, empty_searches = await orchestrate_search(
             chat_model,
@@ -1824,6 +2098,7 @@ async def async_main() -> None:
             max_results_per_query=max_results_per_query,
             region=args.region,
             accept_threshold=accept_threshold,
+            letter_dispatcher=letter_dispatcher,
         )
     if not accepted:
         hint = ""
@@ -1868,50 +2143,17 @@ async def async_main() -> None:
             missing=missing,
         )
 
-    letter_limit = get_letter_batch_limit()
-    letter_candidates = select_letter_candidates(accepted, letter_limit)
-    letters_written = 0
-    if not letter_candidates:
+    letter_stats = await letter_dispatcher.finalize()
+    letters_written = letter_stats.get("completed", 0)
+    if letters_written == 0 and plan.target_candidates > 0:
         console("Keine passenden Kandidaten für Anschreiben gefunden.")
-    else:
-        for candidate in letter_candidates:
-            context = candidate.context
-            snapshot = context.primary if context else None
-            if snapshot is None:
-                snapshot = await asyncio.to_thread(fetch_site_snapshot, candidate.url)
-            qa_result = await generate_letter_with_guardrails(
-                chat_model,
-                identity_summary,
-                candidate,
-                snapshot=snapshot,
-                context=context,
-            )
-            letter_path = store_letter(candidate, qa_result.letter, qa_notes=qa_result.notes)
-            append_log(
-                "letter.saved",
-                candidate=candidate.name,
-                path=str(letter_path),
-                qa_notes=qa_result.notes,
-            )
-            console(f"Anschreiben gespeichert unter: {letter_path}")
-            if candidate.org_slug:
-                org_registry.mark_status(candidate.org_slug, "contacted")
-            blacklist.add(
-                candidate.url,
-                reason="Bereits angeschrieben (Einladung gesendet).",
-                tag="contacted",
-                meta={"letter_path": str(letter_path)},
-            )
-            append_log(
-                "blacklist.add",
-                url=candidate.url,
-                reason="Bereits angeschrieben",
-                tag="contacted",
-            )
-            letters_written += 1
-            if letters_written >= letter_limit:
-                break
-    append_log("pipeline.done", accepted=len(accepted), letters=letters_written)
+    append_log(
+        "pipeline.done",
+        accepted=len(accepted),
+        letters=letters_written,
+        letter_stats=letter_stats,
+    )
+    summarize_run(plan, accepted, all_candidates, letter_stats)
 
     persisted = blacklist.persist()
     if persisted:

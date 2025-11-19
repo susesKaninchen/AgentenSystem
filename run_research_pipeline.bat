@@ -25,6 +25,8 @@ if not exist "%PYTHON_EXE%" (
 set "DEFAULT_PHASE=refine"
 set "DEFAULT_REGION=luebeck-local"
 set "DEFAULT_RESUME=data/staging/candidates_selected.json"
+set "DEFAULT_MAX_ITER=6"
+set "DEFAULT_RESULTS_PER_QUERY=6"
 
 echo(
 echo [PROMPT] Kandidaten-Snapshot vor dem Lauf deduplizieren (tools/seed_registry.py)?
@@ -74,42 +76,74 @@ if "%REGION_CHOICE%"=="7" (
 )
 
 echo(
-echo [PROMPT] Anzahl Anschreiben (1-5) waehlen:
-set /p "LETTER_CHOICE=Briefe pro Lauf [3]: "
-if "%LETTER_CHOICE%"=="" set "LETTER_CHOICE=3"
-for /f "tokens=* delims=0123456789" %%A in ("%LETTER_CHOICE%") do set "LETTER_CHOICE=3"
-set /a "LETTER_CHOICE=%LETTER_CHOICE%"
+echo [PROMPT] Maximale Suchiterationen begrenzen (schont API-Kontingent):
+set "ITER_CHOICE=%DEFAULT_MAX_ITER%"
+set /p "ITER_INPUT=Max Iterationen [%DEFAULT_MAX_ITER%]: "
+if not "%ITER_INPUT%"=="" set "ITER_CHOICE=%ITER_INPUT%"
+set /a ITER_CHOICE=%ITER_CHOICE% >nul 2>&1 || set "ITER_CHOICE=%DEFAULT_MAX_ITER%"
+if %ITER_CHOICE% LSS 1 set "ITER_CHOICE=1"
+set "ITER_ARG=--max-iterations %ITER_CHOICE%"
+
+echo(
+echo [PROMPT] Treffer pro Query begrenzen:
+set "RESULT_CHOICE=%DEFAULT_RESULTS_PER_QUERY%"
+set /p "RESULT_INPUT=Results/Query [%DEFAULT_RESULTS_PER_QUERY%]: "
+if not "%RESULT_INPUT%"=="" set "RESULT_CHOICE=%RESULT_INPUT%"
+set /a RESULT_CHOICE=%RESULT_CHOICE% >nul 2>&1 || set "RESULT_CHOICE=%DEFAULT_RESULTS_PER_QUERY%"
+if %RESULT_CHOICE% LSS 1 set "RESULT_CHOICE=1"
+set "RESULTS_ARG=--results-per-query %RESULT_CHOICE%"
+
+echo(
+echo [PROMPT] Anzahl Anschreiben festlegen (wird 1:1 zum Kandidatenziel):
+set "LETTER_CHOICE=3"
+set /p "LETTER_INPUT=Briefe pro Lauf [3]: "
+if not "%LETTER_INPUT%"=="" set "LETTER_CHOICE=%LETTER_INPUT%"
+set /a LETTER_CHOICE=%LETTER_CHOICE% >nul 2>&1 || set "LETTER_CHOICE=3"
 if %LETTER_CHOICE% LSS 1 set "LETTER_CHOICE=1"
-if %LETTER_CHOICE% GTR 5 set "LETTER_CHOICE=5"
 set "LETTERS_ARG=--letters-per-run %LETTER_CHOICE%"
+
+set "TARGET_DEFAULT=%LETTER_CHOICE%"
+echo(
+echo [PROMPT] Zielanzahl akzeptierter Kandidaten (Stoppt Suche sobald erreicht):
+set "TARGET_CHOICE=%TARGET_DEFAULT%"
+set /p "TARGET_INPUT=Ziel Kandidaten [%TARGET_DEFAULT%]: "
+if not "%TARGET_INPUT%"=="" set "TARGET_CHOICE=%TARGET_INPUT%"
+set /a TARGET_CHOICE=%TARGET_CHOICE% >nul 2>&1 || set "TARGET_CHOICE=%TARGET_DEFAULT%"
+if %TARGET_CHOICE% LSS 1 set "TARGET_CHOICE=1"
+set "TARGET_ARG=--target-candidates %TARGET_CHOICE%"
 
 echo(
 echo [PROMPT] Resume-Modus nutzen (bestehende Kandidaten ohne neue Suche)?
 set /p "RESUME_CHOICE=Resume verwenden (y/N): "
-set "RESUME_ARG="
 set "RESUME_FILE="
 if /I "%RESUME_CHOICE%"=="Y" (
-    set /p "RESUME_FILE=Snapshot-Datei [%DEFAULT_RESUME%]: "
-    if "%RESUME_FILE%"=="" set "RESUME_FILE=%DEFAULT_RESUME%"
-    set "RESUME_ARG=--resume-candidates \"%RESUME_FILE%\""
+    rem Hardcoded Standard-Snapshot (kein manuelles Edit nötig)
+    set "RESUME_FILE=data/staging/candidates_selected.json"
 )
 
 set "PHASE_ARG=--phase %PIPELINE_PHASE%"
 set "REGION_ARG=--region %PIPELINE_REGION%"
-
 echo(
 echo [INFO] Starte Recherche-Pipeline via uv ...
 echo         Phase  : %PIPELINE_PHASE%
 echo         Region : %PIPELINE_REGION%
 echo         Briefe : %LETTER_CHOICE%
-if defined RESUME_ARG (
-    echo         Resume : %RESUME_FILE%
+echo         Iter.  : %ITER_CHOICE%
+echo         Hits/Q : %RESULT_CHOICE%
+echo         Ziel   : %TARGET_CHOICE%
+if defined RESUME_FILE (
+    set "RESUME_DISPLAY=%RESUME_FILE%"
 ) else (
-    echo         Resume : nein
+    set "RESUME_DISPLAY=nein"
 )
+echo         Resume : %RESUME_DISPLAY%
 echo         (weitere Argumente aus CLI: %*)
 echo.
-uv run %ENV_FLAG% python workflows/research_pipeline.py %PHASE_ARG% %REGION_ARG% %LETTERS_ARG% %RESUME_ARG% %*
+if defined RESUME_FILE (
+    uv run %ENV_FLAG% python workflows/research_pipeline.py %PHASE_ARG% %REGION_ARG% %ITER_ARG% %RESULTS_ARG% %LETTERS_ARG% %TARGET_ARG% --resume-candidates "%RESUME_FILE%" %*
+) else (
+    uv run %ENV_FLAG% python workflows/research_pipeline.py %PHASE_ARG% %REGION_ARG% %ITER_ARG% %RESULTS_ARG% %LETTERS_ARG% %TARGET_ARG% %*
+)
 if errorlevel 1 (
     echo [ERR] Pipeline beendet mit Fehlercode %errorlevel%.
 ) else (
