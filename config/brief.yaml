@@ -1,0 +1,55 @@
+task: >
+  Recherchiere passende Organisationen/Teams für die Maker Faire Lübeck 2026 und erstelle personalisierte Erstkontakt‑Nachrichten.
+
+target_profile: >
+  Bevorzuge nicht‑kommerzielle Maker:innen, Hackspaces, offene Werkstätten, Repair‑Initiativen sowie Kultur‑/Bildungskollektive
+  aus Norddeutschland. Wichtig: seriöse Selbstdarstellung und eine erreichbare Kontaktmöglichkeit (idealerweise E‑Mail).
+
+message_template_path: config/outreach_template.md
+language: de
+focus_areas:
+  - Maker Faire Lübeck 2026
+  - Norddeutschland
+commercial_mode: prefer_noncommercial
+require_contact_email: true
+max_message_words: 260
+avoid_promises: true
+
+search_focus_keywords:
+  - verein
+  - e.v.
+  - initiative
+  - kollektiv
+  - makerspace
+  - hackerspace
+  - offene werkstatt
+  - fablab
+  - open lab
+  - repair café
+  - repair cafe
+  - gemeinnützig
+  - gemeinnuetzig
+  - lübeck
+  - luebeck
+  - hamburg
+  - kiel
+  - schleswig-holstein
+  - mecklenburg-vorpommern
+
+exclude_url_suffixes:
+  - .pdf
+  - .csv
+  - .doc
+  - .ppt
+  - .xls
+  - .zip
+
+exclude_domains:
+  - bundestag.de
+  - scribd.com
+
+exclude_text_terms:
+  - outlet
+  - shopping center
+  - shopping-centre
+  - einkaufszentrum

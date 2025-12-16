@@ -21,12 +21,14 @@
   - `OPENAI_MODEL`
   - `GOOGLE_API_KEY` (optional – ohne fällt die Suche auf DuckDuckGo zurück)
   - `GOOGLE_SEARCH_ENGINE_ID` (optional – benötigt für Google Custom Search)
+  - `PIPELINE_BRIEF` (optional – Pfad zu `config/brief.yaml`, steuert Auftrag/Zielprofil/Template/Filter)
   - `PIPELINE_TARGET_CANDIDATES` (optional – überschreibt das Ziel akzeptierter Kandidaten, standardmäßig = Briefeingabe)
 - Feintuning-Variablen:
   - `PIPELINE_MAX_ITERATIONS` (Standard 10) – bestimmt, wie viele Suchrunden gefahren werden.
-  - `PIPELINE_RESULTS_PER_QUERY` (Standard 10) – Anzahl der Webresultate pro Query.
+  - `PIPELINE_RESULTS_PER_QUERY` (Standard 6) – Anzahl der Webresultate pro Query.
   - `MAX_LETTERS_PER_RUN` (Standard 3) – wie viele Anschreiben pro Lauf generiert werden.
-- Laufzeit-Presets können auch über CLI gewählt werden: `python workflows/research_pipeline.py --phase <explore|refine|acquire> --region <nord|hamburg|luebeck|...>`. Ohne Flags greifen die oben genannten Env-Variablen.
+  - `PIPELINE_CANDIDATE_CONCURRENCY` (Standard 4) – parallele Kandidaten-Verarbeitung.
+- Laufzeit-Presets können auch über CLI gewählt werden: `python workflows/research_pipeline.py --brief config/brief.yaml --phase <explore|refine|acquire> --region <any|nord|hamburg|luebeck|...>`. Ohne Flags greifen die oben genannten Env-Variablen.
 - Bei lokalen Tests `dotenv` laden oder Environment im Deployment konfigurieren.
 - Beispielkonfiguration liegt in `.env.example` (nur Platzhalter, keine echten Werte).
 - `ENABLE_WEB_SEARCH_TOOL=0/1` steuert, ob das OpenAI-WebSearchTool genutzt wird. Bei `0` laufen wir direkt über DuckDuckGo.
@@ -38,7 +40,7 @@
   - `docs/use-cases/` (geplante Vertiefungen, z. B. Maker Faire Recherche).
   - Datenspeicher für gecrawlte Ergebnisse (z. B. `data/staging/`) und persistierte Anschreiben (`outputs/letters/`).
 - NorthData (https://www.northdata.de) für Firmenhintergründe via Suggest-API, Ergebnisse werden automatisch unter `data/staging/enrichment/` abgelegt.
-- WebSearchTool (OpenAI Responses API) ist der Standard für Recherche; wenn das nicht verfügbar ist, fällt das System auf Google/DuckDuckGo (`tools/google_search.py` / `tools/duckduckgo.py`) zurück. Query- und Ergebnis-Logs liegen in `data/staging/search/`. Alle Queries werden automatisch mit Maker-/Vereins-Schlagworten angereichert, während kommerzielle/out-of-scope Treffer bereits bei der Result-Verarbeitung gefiltert werden.
+- WebSearchTool (OpenAI Responses API) ist der Standard für Recherche; wenn das nicht verfügbar ist, fällt das System auf Google/DuckDuckGo (`tools/google_search.py` / `tools/duckduckgo.py`) zurück. Query- und Ergebnis-Logs liegen in `data/staging/search/`. Query-Fokus (Keywords) und Hard-Filters (Suffix/Domains/Terms) werden über `config/brief.yaml` gesteuert.
 - Sammelseiten/Verzeichnisse (z. B. „Werkstätten-Übersichten“, „Meet the Makers“) werden automatisch mit `tools/directory_parser.py` ausgewertet; die daraus extrahierten Untereinträge landen als neue Kandidat:innen in der Pipeline und werden in `data/staging/directory_expansions/` gecacht.
 - PDF-/Listenquellen (z. B. bundestag.de, scribd.com) sowie andere „schwergewichtige“ Domains werden vor der Evaluierung herausgefiltert, um irrelevante Treffer zu vermeiden.
 - Bei wiederholten Rate-Limits stoppt der Workflow frühzeitig; vorhandene Kandidaten/Resume-Snapshots werden genutzt, Seed-Kandidaten entfallen.
@@ -71,11 +73,13 @@
 
 ## Datenhaltung
 - Primärer Speicher sind Textdateien/Markdown/JSON in `data/` und `outputs/`; keine Datenbanken im Standardbetrieb.
-- Strukturierte Ergebnisse pro Auftrag als eigenständige Datei ablegen (`data/staging/` für Rohdaten, `outputs/letters/` für Anschreiben).
+- Briefing/Vorlagen liegen unter `config/` (`config/brief.yaml`, `config/outreach_template.md`, `config/identity.yaml`) und werden von Pipeline/Chat als persistente Grundlage genutzt.
+- Strukturierte Ergebnisse pro Auftrag als eigenständige Datei ablegen (`data/staging/` für Rohdaten, `outputs/letters/` für Entwürfe).
 - Externe Anreicherungen (z. B. NorthData) separat versionierbar speichern (`data/staging/enrichment/`).
 - Suchtreffer und Evaluations-Snapshots versionierbar halten (`data/staging/search/`, `data/staging/candidates_selected.json`), um Feedback-Loops nachvollziehen zu können.
 - Ergebnisse der Directory-Parser-Läufe (`data/staging/directory_expansions/`) speichern, damit nachvollziehbar bleibt, welche Sammelseiten wir in konkrete Kontakte aufgelöst haben.
 - Automatische Webseiten-Snapshots für personalisierte Anschreiben liegen in `data/staging/snapshots/` (generiert durch `tools/site_scraper.py`).
+- Strukturierte Gegenüber-Profile werden zusätzlich nach `outputs/profiles/*.json` geschrieben (Profil-Enricher, als Faktenbasis für Writer/QA).
 - Snapshots umfassen auch relevante Unterseiten (Kontakt, About, Impressum), damit Evaluator:innen und Koordinatoren mehr Kontext erhalten.
 - Organisations-Registry unter `data/staging/organizations_registry.json` hält Slugs, Status (seen/accepted/contacted) und verhindert Mehrfachbearbeitung; gepflegt via `tools/org_registry.py` und Supervisor-Agent.
 - Geo-Heuristiken (Nominatim-Stub) filtern Off-Region-Treffer direkt in der Pipeline; zukünftige echte Geocode-APIs können dieselbe Schnittstelle weiterverwenden.
@@ -83,7 +87,11 @@
 - Details zu Ablageformaten, QA-Metadaten und Logging stehen in `docs/data_persistence.md`. Pipelinelogs landen in `logs/pipeline.log` (JSON pro Event).
 - Kontakte, die bereits angeschrieben oder aufgrund von Qualitätsproblemen gesperrt wurden, landen in `data/staging/blacklist.json` (verwaltet über `tools/blacklist.py`). Die Datei verhindert doppelte Anschreiben und dokumentiert Sperrgründe.
 - `tools/seed_registry.py` kann bei Bedarf genutzt werden, um `data/staging/candidates_selected.json` zu deduplizieren und die Organisations-Registry aus bestehenden Daten neu zu befüllen.
-- Windows-Shortcut: `run_research_pipeline.bat` bietet interaktive Prompts für Phase/Region/Briefe, optionales Seed/Dedupe (`tools/seed_registry.py`), begrenzt bei Bedarf Iterationen/Treffer pro Query, setzt das Kandidatenziel und kann den Resume-Modus ohne manuelle CLI-Flags starten (nutzt automatisch `data/staging/candidates_selected.json`).
+- Chat-Einstieg: `uv run python workflows/chat_entry.py` ist der Standard. Moderierter Dialog: fasst zusammen, was schon bekannt ist, stellt gezielte Rückfragen und bereitet Datei-Updates (Identity/Brief/Template/Notes/Registry/Blacklist/Snapshot) vor; Schreiben/Start erst nach expliziter Bestätigung (`ja/nein`).
+- Site-Scraper extrahiert Kontaktinformationen (mailto-/Text-E-Mails, einfache Namen/Hinweise) aus Haupt- und Kontaktseiten und persistiert sie in `data/staging/snapshots/*.json`; Kontakte werden für Acceptance und Personalisierung genutzt.
+- Stop-Schalter: `--stop-file data/staging/stop.flag` verhindert neue Such-/Scrape-Aufgaben, laufende Tasks werden sauber beendet.
+- Kontakt-Export: akzeptierte Kandidaten mit E-Mails werden zusätzlich nach `outputs/contacts.csv` geschrieben (Name, URL, E-Mail, Org-Slug, Notizen).
+- Zentrale Settings: `config/pipeline.yaml` hält Defaults (Phase, Region, Zielgröße, Iterationen, Treffer/Query, Briefe, Search-Retries, Stop-File, Candidate-Concurrency); Env/CLI können alles übersteuern.
 - `logs/pipeline.log` hält neben Events jetzt auch strukturierte Zusammenfassungen eines Laufs (akzeptiert, Briefe fertig/offen, Top-Ablehnungsgründe).
 
 ## Identität & Kontext
@@ -98,7 +106,7 @@
 - [x] Proof-of-Concept: Einfache Pipeline (Diagnostics-Agent über `workflows/poc.py`) implementieren und Verbindung testen.
 - [x] Datenpersistenz (Dateisystem) und Logging-Format definieren (`docs/data_persistence.md`, `logs/pipeline.log`).
 - [x] Guardrails konfigurieren (DIN-A4-Limit, keine Versprechen, QA-Freigabe).
-- [ ] Automatisierte Tests/Smoke-Checks für zentrale Agenten (zurzeit zurückgestellt, sobald stabiler Workflow benötigt wird).
+- [ ] Automatisierte Tests/Smoke-Checks für zentrale Agenten (Mocks für Suche/Scraper/Writer).
 - [x] Recherche-Workflow erweitern (Planner → Recherche → Writer) mit Datei-Ausgaben anlegen (`workflows/research_pipeline.py`).
 - [x] Datenquellen-Anbindung (Google Custom Search + NorthData-Enrichment) automatisieren, inklusive Feedback-Schleifen und Persistenz.
 - [x] Offizielles Tooling aus dem OpenAI *research_bot* nachbilden (Pydantic-Planner, Tool-Aufrufe per `Runner.run` in async-Tasks, Trace-Integration).
@@ -108,6 +116,13 @@
 - [x] Koordinator-Agent + Domain-Blacklist einführen (Mini-Dialoge, Keyword-Handoffs, keine doppelten Anschreiben).
 - [x] ResultFilter + Subseiten-Scraper einführen (deduplizierte Treffer, automatische Kontakt-/About-Infos für Evaluator & Koordinator).
 - [x] Organisations-Supervisor + Registry etablieren (Slug-Zuordnung, Persistenz `organizations_registry.json`, deduplizierte Mehrfachtreffer).
+- [x] Chat-gestützte Steuerung als Standardeinstieg (ersetzt `run_research_pipeline.bat`): LLM-Dialog fragt Phase/Region/Iterationen/Briefe/Resume ab, kann zentrale Dateien (Identity, Registry/Blacklist, Research-Notizen) nach Nutzerfreigabe editieren und startet erst nach Bestätigung.
+- [ ] Lauf-Abbruch/Pause: „Stop new tasks“-Schalter, der neue Suche/Scrapes/Letters blockt, laufende Tasks sauber abschließt und den Status protokolliert.
+- [ ] Fehlerrobuste Pipeline: Jede Agentenstufe mit Try/Except/Timeouts absichern, Teilfehler in Logs dokumentieren und Lauf weiterführen statt Hard-Abbruch.
+- [ ] Qualitätsziel verkleinern: Standard-Zielzahl zunächst 5 akzeptierte Kandidat:innen mit bestätigten E-Mail-Kontakten; Acceptance-Gate, das fehlende Mails blockt oder gezielt Nach-Scrapes triggert.
+- [ ] Site-Scraper erweitern für Kontakt-Personalisierung: intensiver auf Kontakt/Team/Impressum crawlen, E-Mail/Name/Fundstelle strukturieren, Mehrtreffer deduplizieren.
+- [ ] Anschreiben-Personalisierung: Wortlimit erhöhen, persönlicher Einstieg mit Bezug auf gefundene Kontaktinfos; QA-Regeln entsprechend anpassen.
+- [ ] LLM-Kontrollinstanz stärkt Suche: Zwischenergebnisse/Logs prüfen, Queries dynamisch anpassen, gespeicherte Dateien auf Wunsch des Nutzers aktualisieren (Resume, Blacklist, Identity, Notes).
 - [ ] Nonprofit/Maker-Scoring einführen (Region, Quelle, DIY/Nonprofit-Merkmale bevor `accepted=True`).
 - [ ] Deduplizierung & Kanonisierung von Organisationen (Subseiten als Tags, eine Kontaktkartei).
 - [ ] Kontakt-Extraktion (Impressum/Schema.org) + CSV/Markdown-Export für Outreach.
@@ -115,15 +130,22 @@
 - [x] Seed-Fallback der Suche entfernen; leere Läufe verlangen jetzt manuelle Query-Anpassung oder Resume.
 - [x] Site-Scraper gegen HTML/XML-Encoding-Probleme absichern (Soft-Failure statt Pipeline-Abbruch).
 - [x] Agentische Query-Erzeugung priorisieren: Query-Refiner nutzt aktuelle Funde + direkte Links (JSON `direct_urls`), harte Query-Listen dienen nur noch als Kontext.
-- [ ] Fehlertolerante Laufsteuerung (Backoff, Resume-Automatismen, klare Fehlerlogs) ohne künstliche Seeds.
-- [ ] Partner-/Netzwerk-Links automatisch aus gecrawlten Seiten extrahieren und als neue Kandidaten einspeisen.
-- [ ] LetterDispatcher mit Metriken & Smoke-Test absichern (inkl. Mock-Scraper).
-- [ ] Backoff/Retry für Google/DuckDuckGo und optionalen Auto-Resume implementieren.
+- [x] Fehlertolerante Laufsteuerung (Stop-Flag) und Kontakt-Gate eingeführt.
+- [x] Partner-Link-Discovery (Basis): ausgehende Links werden aus Snapshots dedupliziert, als Kandidaten angelegt und durch die Pipeline geschickt (begrenzte Anzahl pro Quelle).
+- [ ] LetterDispatcher Metriken/Smoke-Tests ausbauen (Telemetrie vorhanden, Tests fehlen).
+- [x] Backoff/Retry für Google/DuckDuckGo (Basis) und Stop-Flag integriert; Auto-Resume noch offen.
+- [ ] Architektur-Refactor: zentrale Modelle/Settings (z. B. `config/pipeline.yaml`, `models.py`), weniger Hardcodes in `workflows/research_pipeline.py`.
+- [x] Feedback-Loop vereinheitlichen (FeedbackBus sammelt Hinweise für Query-Refiner); Query-Listen weiterhin als Fallback.
+- [ ] Dynamic Queries statt Starrlisten: LLM-Refiner nutzt echte Funde/Kontakte, Region/Keyword-Presets nur initial.
+- [ ] Nonprofit/Maker-Scoring als dedizierte Stufe vor Acceptance + Export/CSV/Markdown finalisieren.
+- [x] Chat-Launcher weiter absichern (Edit-Guardrails, Logs/Letter-Preview; Stop-Flag-Hinweise).
 
 ## Aktueller Plan
-1. Link-Discovery direkt aus gecrawlten Seiten ausbauen (z. B. Partnerlisten, Netzwerksektionen) und automatisch als neue Kandidaten übergeben.
-2. Fehlertoleranz stärken: Backoff/Retries für Such-Backends + optionaler Auto-Resume, damit lange Läufe stabil bleiben.
-3. Tooling/Testebene ausbauen: Smoke-Tests für Site-Scraper, Directory-Parser und LetterDispatcher inkl. Telemetrie, damit Parsing-/QA-Probleme sofort auffallen.
+1. Architektur-Refactor: zentrale Modelle/Settings (z. B. `config/pipeline.yaml`, gemeinsame `models.py`), harte Defaults/Listen aus dem Code ziehen.
+2. Feedback-Loop erneuern: FeedbackBus einführen (Evaluator/Koordinator/ResultFilter → Query-Refiner), Queries dynamisch aus Funden/Kontakten ableiten; Presets nur Fallback.
+3. Robustheit: Backoff/Retry + Auto-Resume für Suche/Scraper, Stop-Flag in den Runner integrieren; Logs/Metriken vereinheitlichen.
+4. Outreach-Qualität: Nonprofit/Maker-Scoring als Pflicht-Gate, Kontakt-Export (CSV/Markdown) harmonisieren, Writer/QA auf neue Datenmodelle umstellen.
+5. Chat-Launcher verfeinern: Edit-Guardrails, mehr Kontext (Logs/Briefe), optionale Start-/Stop-Hooks für laufende Tasks.
 
 ## Offene Fragen
 - Welche konkreten Datenquellen stehen für die Recherche langfristig zur Verfügung (APIs, interne Datenbanken)?

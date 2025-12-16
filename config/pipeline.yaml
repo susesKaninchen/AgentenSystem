@@ -1,0 +1,10 @@
+phase: refine
+region: luebeck-local
+target_candidates: 5
+max_iterations: 10
+results_per_query: 6
+letters_per_run: 5
+candidate_concurrency: 4
+search_retries: 2
+search_retry_backoff: 3.0
+stop_file: data/staging/stop.flag

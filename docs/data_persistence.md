@@ -13,7 +13,11 @@
   - `candidates_selected.json`: Snapshot mit akzeptierten/abgelehnten Kandidaten.
   - `research_notes.md`: Markdown-Zusammenfassung (Plan, Bewertungen, Quellen).
   - `connection_check.txt`: Health-Check-Ergebnisse (`workflows/poc.py`).
-- `outputs/letters/`: Finale Anschreiben (`<slug>.md`) inklusive Quellenhinweisen.
+- `data/staging/last_run.json`: Kurz-Zusammenfassung des letzten Laufs (für Resume/Chat-Kontext).
+- `data/staging/chat_state.json`: Letzte Chat-Konfiguration (Einstiegspunkt merkt sich Settings).
+- `outputs/letters/`: Nachrichten-Entwürfe (`<slug>.md`) inklusive Metadaten.
+- `outputs/profiles/`: Strukturierte Gegenüber-Profile (`<slug>.json`) als Faktenbasis für Personalisierung.
+- `outputs/contacts.csv`: Kontakt-Export (Name, URL, E-Mail, Org-Slug, Notizen).
 - `logs/`
   - `pipeline.log`: Chronologisches Log pro Lauf mit strukturierter JSON-Linie.
   - Weitere Logs (Tool-spezifisch) optional, Schema identisch.
@@ -71,6 +75,12 @@
     ---
     ```
   - Anschreiben-Text (max. 1 DIN-A4-Seite, keine Versprechungen, Quellenhinweis).
+
+- **Profile (`outputs/profiles/*.json`)**
+  - Strukturierte Zusammenfassung pro akzeptiertem Kandidaten (Typ/Größe/Kategorie, Werte, Aktivitäten, Kontakte, Confidence, Missing-Felder).
+
+- **Kontakt-Export (`outputs/contacts.csv`)**
+  - CSV mit `name,url,email,org_slug,notes` (nur Kandidaten mit gefundenen E-Mails).
 
 - **Logs (`logs/pipeline.log`)**
   - Eine JSON-Zeile pro Event:

@@ -1,0 +1,126 @@
+{
+  "generated_at": "2025-12-15T15:47:09+00:00",
+  "entries": [
+    {
+      "domain": "bremen.de",
+      "url": "https://www.bremen.de/leben-in-bremen/wohnen/muell/repair-cafes",
+      "reason": "Die Seite ist ein generisches Verzeichnis von Repair‑Cafés und liefert keine einzelne, kontaktfähige Organisation.",
+      "tag": "coordinator",
+      "added_at": "2025-12-15T15:36:16+00:00",
+      "source": "coordinator",
+      "meta": {
+        "candidate": "Repair Cafés in Bremen - Wegwerfen kann doch jeder!"
+      }
+    },
+    {
+      "domain": "collinsaerospace.com",
+      "url": "https://www.collinsaerospace.com/who-we-are/lang/de/germany",
+      "reason": "Kommerzielles Luftfahrtunternehmen, nicht relevant für nicht‑kommerziellen Maker‑Faire‑Kontakt.",
+      "tag": "coordinator",
+      "added_at": "2025-12-15T15:42:44+00:00",
+      "source": "coordinator",
+      "meta": {
+        "candidate": "Germany | Collins Aerospace"
+      }
+    },
+    {
+      "domain": "de.wikipedia.org",
+      "url": "https://de.wikipedia.org/wiki/Kategorie:Tischtennisverein_aus_Schleswig-Holstein",
+      "reason": "Verzeichnis (Wikipedia‑Kategorie) ohne direkte Kontaktinformationen und ohne Bezug zu Maker‑ oder Hackspace‑Aktivitäten; ungeeignet für das Ziel.",
+      "tag": "coordinator",
+      "added_at": "2025-12-15T15:46:24+00:00",
+      "source": "coordinator",
+      "meta": {
+        "candidate": "Tischtennisverein aus Schleswig-Holstein"
+      }
+    },
+    {
+      "domain": "fablab.sh",
+      "url": "https://fablab.sh/about/",
+      "reason": "Bereits angeschrieben (Einladung gesendet).",
+      "tag": "contacted",
+      "added_at": "2025-12-15T15:41:36+00:00",
+      "source": "pipeline",
+      "meta": {
+        "letter_path": "outputs/letters/ueber-uns-fablab-kiel.md"
+      }
+    },
+    {
+      "domain": "github.com",
+      "url": "https://github.com/features/codespaces",
+      "reason": "Kommerzielles Produkt ohne Bezug zu lokalen, nicht‑kommerziellen Maker‑Organisationen – eindeutig ungeeignet.",
+      "tag": "coordinator",
+      "added_at": "2025-12-15T15:38:33+00:00",
+      "source": "coordinator",
+      "meta": {
+        "candidate": "CodespacesInstant dev environments"
+      }
+    },
+    {
+      "domain": "hamburg.ccc.de",
+      "url": "https://hamburg.ccc.de/",
+      "reason": "Bereits angeschrieben (Einladung gesendet).",
+      "tag": "contacted",
+      "added_at": "2025-12-15T15:34:24+00:00",
+      "source": "pipeline",
+      "meta": {
+        "letter_path": "outputs/letters/ccc-hansestadt-hamburg-e-v.md"
+      }
+    },
+    {
+      "domain": "local.fedex.com",
+      "url": "https://local.fedex.com/de-de",
+      "reason": "Kommerzielle Logistik‑Website, eindeutig ungeeignet für die Zielgruppe von nicht‑kommerziellen Maker‑Organisationen.",
+      "tag": "coordinator",
+      "added_at": "2025-12-15T15:42:52+00:00",
+      "source": "coordinator",
+      "meta": {
+        "candidate": "Find FedEx locations in Germany"
+      }
+    },
+    {
+      "domain": "ow-norderstedt.de",
+      "url": "https://www.ow-norderstedt.de/",
+      "reason": "Bereits angeschrieben (Einladung gesendet).",
+      "tag": "contacted",
+      "added_at": "2025-12-15T15:34:42+00:00",
+      "source": "pipeline",
+      "meta": {
+        "letter_path": "outputs/letters/offene-werkstatt-norderstedt.md"
+      }
+    },
+    {
+      "domain": "tag-der-offenen-toepferei.de",
+      "url": "https://www.tag-der-offenen-toepferei.de/bundesland/schleswig-holstein",
+      "reason": "Verzeichnis von vielen einzelnen Keramikwerkstätten, keine eigenständige Organisation, daher nicht zielgerichtet für die Suche nach passenden Maker‑Teams.",
+      "tag": "coordinator",
+      "added_at": "2025-12-15T15:34:21+00:00",
+      "source": "coordinator",
+      "meta": {
+        "candidate": "Teilnehmer in Schleswig-Holstein | Tag der offenen Töpferei"
+      }
+    },
+    {
+      "domain": "vdini-club.de",
+      "url": "https://www.vdini-club.de",
+      "reason": "Seite ist ein überregionaler Bildungs‑Club ohne Bezug zu Lübeck; nicht relevant für die Maker‑Community‑Suche.",
+      "tag": "coordinator",
+      "added_at": "2025-12-15T15:34:52+00:00",
+      "source": "coordinator",
+      "meta": {
+        "candidate": "VDIni-Club"
+      }
+    },
+    {
+      "domain": "wiki.ccchh.net",
+      "url": "https://wiki.ccchh.net/club:z9:start",
+      "reason": "Meta‑Wiki/Verzeichnis ohne eigenen physischen Standort, falsche Region (Hamburg) und keine geeignete Kontaktmöglichkeit.",
+      "tag": "coordinator",
+      "added_at": "2025-12-15T15:33:49+00:00",
+      "source": "coordinator",
+      "meta": {
+        "candidate": "Clubräume"
+      }
+    }
+  ]
+}

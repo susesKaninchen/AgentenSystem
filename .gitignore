@@ -212,3 +212,18 @@ data/staging/search/
 data/staging/candidates_selected.json
 data/staging/organizations_registry.json
 data/staging/snapshots/
+data/staging/directory_expansions/
+data/staging/last_run.json
+data/staging/chat_state.json
+data/staging/research_notes.md
+data/staging/connection_check.txt
+data/backup/
+
+outputs/letters/*
+!outputs/letters/.gitkeep
+outputs/profiles/*
+!outputs/profiles/.gitkeep
+outputs/contacts.csv
+
+logs/last error.txt
+logs/pipeline.log

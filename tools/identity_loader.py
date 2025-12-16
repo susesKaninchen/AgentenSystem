@@ -33,10 +33,17 @@ def get_identity_summary(identity: dict[str, Any]) -> str:
     """
     Erstellt eine kurze textuelle Zusammenfassung der Identitaet als Prompt-String.
     """
-    org = identity.get("organization", {})
-    rep = identity.get("representative", {})
-    event = identity.get("event", {})
-    msg = identity.get("messaging_guidelines", {})
+    def as_dict(value: Any) -> dict[str, Any]:
+        if isinstance(value, dict):
+            return value
+        if isinstance(value, str) and value.strip():
+            return {"name": value.strip()}
+        return {}
+
+    org = as_dict(identity.get("organization"))
+    rep = as_dict(identity.get("representative"))
+    event = as_dict(identity.get("event"))
+    msg = as_dict(identity.get("messaging_guidelines"))
 
     parts: list[str] = []
 
