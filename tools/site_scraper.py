@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import asdict, dataclass
+import time
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable, List, Optional
@@ -20,6 +21,8 @@ MAX_FETCH_BYTES = 3_000_000
 HIGHLIGHT_LIMIT = 5
 SUMMARY_MIN_CHARS = 60
 SUMMARY_MAX_CHARS = 480
+XML_DECLARATION_RE = re.compile(r"^\s*<\?xml[^>]*encoding[^>]*\?>", re.IGNORECASE)
+EMAIL_RE = re.compile(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", re.IGNORECASE)
 LOCATION_CUES = [
     "lübeck",
     "hamburg",
@@ -46,10 +49,19 @@ RELATED_PATH_HINTS = [
     "mitmachen",
 ]
 MAX_RELATED_PAGES = 4
+LINK_LIMIT = 12
 
 
 class SiteScraperError(RuntimeError):
     """Signals fetch/parse issues for site snapshots."""
+
+
+@dataclass
+class ContactInfo:
+    email: str
+    name: str = ""
+    context: str = ""
+    source_url: str = ""
 
 
 @dataclass
@@ -59,6 +71,8 @@ class SiteSnapshot:
     summary: str
     highlights: List[str]
     detected_location: Optional[str]
+    contacts: List[ContactInfo] = field(default_factory=list)
+    links: List[str] = field(default_factory=list)
 
 
 def _slugify(url: str) -> str:
@@ -112,6 +126,65 @@ def _extract_highlights(doc: html.HtmlElement) -> List[str]:
     return highlights
 
 
+def _extract_contacts(doc: html.HtmlElement, url: str) -> List[ContactInfo]:
+    contacts: List[ContactInfo] = []
+    seen: set[str] = set()
+
+    def add_contact(email: str, name: str = "", context: str = "") -> None:
+        normalized = email.strip().lower()
+        if not normalized or normalized in seen:
+            return
+        seen.add(normalized)
+        contacts.append(ContactInfo(email=normalized, name=name.strip(), context=context.strip(), source_url=url))
+
+    for node in doc.xpath("//a[starts-with(@href, 'mailto:')]"):
+        href = node.attrib.get("href", "")
+        mail = href.split("mailto:")[-1].split("?")[0]
+        text = " ".join(node.text_content().split())
+        add_contact(mail, name=text, context="mailto link")
+
+    text_blob = " ".join(doc.text_content().split())
+    for match in EMAIL_RE.findall(text_blob):
+        add_contact(match, context="page text")
+
+    if not contacts:
+        # Suche nach Kontaktblöcken (Impressum/Kontakt)
+        for section in doc.xpath("//section[contains(translate(., 'KONTAKT', 'kontakt'), 'kontakt') or contains(translate(., 'IMPRESSUM', 'impressum'), 'impressum')]"):
+            section_text = " ".join(section.text_content().split())
+            for match in EMAIL_RE.findall(section_text):
+                add_contact(match, context="contact section")
+
+    return contacts
+
+
+def _extract_links(doc: html.HtmlElement, url: str) -> List[str]:
+    parsed = urlparse(url)
+    base_domain = parsed.netloc.lower()
+    links: List[str] = []
+    seen: set[str] = set()
+    for node in doc.xpath("//a[@href]"):
+        href = node.attrib.get("href", "").strip()
+        if not href:
+            continue
+        if href.startswith("#") or href.startswith("mailto:"):
+            continue
+        absolute = urljoin(url, href)
+        parsed_link = urlparse(absolute)
+        if not parsed_link.scheme.startswith("http"):
+            continue
+        domain = parsed_link.netloc.lower()
+        if domain == base_domain:
+            continue
+        normalized = absolute.rstrip("/")
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        links.append(normalized)
+        if len(links) >= LINK_LIMIT:
+            break
+    return links
+
+
 def _detect_location(text: str) -> Optional[str]:
     lowered = text.lower()
     for cue in LOCATION_CUES:
@@ -123,18 +196,36 @@ def _detect_location(text: str) -> Optional[str]:
     return None
 
 
+def _strip_encoding_declaration(text: str) -> str:
+    return XML_DECLARATION_RE.sub("", text, count=1)
+
+
 def _parse_snapshot(url: str, html_text: str) -> SiteSnapshot:
-    doc = html.fromstring(html_text)
+    sanitized = _strip_encoding_declaration(html_text)
+    try:
+        doc = html.fromstring(sanitized)
+    except ValueError as exc:
+        message = str(exc)
+        if "encoding declaration" in message.lower():
+            try:
+                doc = html.fromstring(sanitized.encode("utf-8", errors="ignore"))
+            except ValueError as inner_exc:
+                raise SiteScraperError(f"Fehler beim HTML-Parsing für {url}: {inner_exc}") from inner_exc
+        else:
+            raise SiteScraperError(f"Fehler beim HTML-Parsing für {url}: {exc}") from exc
     title = (" ".join(doc.xpath("//title/text()")) or url).strip()
     summary = _extract_summary(doc)
     highlights = _extract_highlights(doc)
     location = _detect_location(summary + " " + " ".join(highlights))
+    contacts = _extract_contacts(doc, url)
     return SiteSnapshot(
         url=url,
         title=title,
         summary=summary,
         highlights=highlights,
         detected_location=location,
+        contacts=contacts,
+        links=_extract_links(doc, url),
     )
 
 
@@ -146,12 +237,29 @@ def load_cached_snapshot(url: str) -> Optional[SiteSnapshot]:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except json.JSONDecodeError:
         return None
+    contacts: List[ContactInfo] = []
+    for entry in payload.get("contacts", []) or []:
+        if not isinstance(entry, dict):
+            continue
+        email = entry.get("email")
+        if not email:
+            continue
+        contacts.append(
+            ContactInfo(
+                email=email,
+                name=entry.get("name", ""),
+                context=entry.get("context", ""),
+                source_url=entry.get("source_url", payload.get("url", url)),
+            )
+        )
     return SiteSnapshot(
         url=payload.get("url", url),
         title=payload.get("title", url),
         summary=payload.get("summary", ""),
         highlights=payload.get("highlights", []) or [],
         detected_location=payload.get("detected_location"),
+        contacts=contacts,
+        links=payload.get("links", []) or [],
     )
 
 
@@ -163,18 +271,24 @@ def store_snapshot(snapshot: SiteSnapshot) -> Path:
     return path
 
 
-def fetch_site_snapshot(url: str, *, use_cache: bool = True) -> Optional[SiteSnapshot]:
+def fetch_site_snapshot(url: str, *, use_cache: bool = True, retries: int = 1, backoff: float = 2.0) -> Optional[SiteSnapshot]:
     if use_cache:
         cached = load_cached_snapshot(url)
         if cached:
             return cached
-    try:
-        html_text = _fetch(url)
-    except SiteScraperError:
-        return None
-    snapshot = _parse_snapshot(url, html_text)
-    store_snapshot(snapshot)
-    return snapshot
+    attempt = 0
+    while attempt <= retries:
+        try:
+            html_text = _fetch(url)
+            snapshot = _parse_snapshot(url, html_text)
+            store_snapshot(snapshot)
+            return snapshot
+        except SiteScraperError:
+            attempt += 1
+            if attempt > retries:
+                return None
+            time.sleep(backoff * attempt)
+    return None
 
 
 def build_related_urls(url: str, hints: Iterable[str] = RELATED_PATH_HINTS) -> List[str]:
@@ -196,13 +310,13 @@ def build_related_urls(url: str, hints: Iterable[str] = RELATED_PATH_HINTS) -> L
     return related
 
 
-def fetch_related_snapshots(url: str, *, max_pages: int = MAX_RELATED_PAGES, use_cache: bool = True) -> List[SiteSnapshot]:
+def fetch_related_snapshots(url: str, *, max_pages: int = MAX_RELATED_PAGES, use_cache: bool = True, retries: int = 1, backoff: float = 2.0) -> List[SiteSnapshot]:
     snapshots: List[SiteSnapshot] = []
     for candidate in build_related_urls(url)[:max_pages]:
-        snapshot = fetch_site_snapshot(candidate, use_cache=use_cache)
+        snapshot = fetch_site_snapshot(candidate, use_cache=use_cache, retries=retries, backoff=backoff)
         if snapshot:
             snapshots.append(snapshot)
     return snapshots
 
 
-__all__ = ["SiteSnapshot", "SiteScraperError", "fetch_site_snapshot", "fetch_related_snapshots", "build_related_urls"]
+__all__ = ["ContactInfo", "SiteSnapshot", "SiteScraperError", "fetch_site_snapshot", "fetch_related_snapshots", "build_related_urls"]

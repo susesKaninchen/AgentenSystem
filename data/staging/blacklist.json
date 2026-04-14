@@ -1,5 +1,5 @@
 {
-  "generated_at": "2025-12-15T15:47:09+00:00",
+  "generated_at": "2025-12-16T07:20:11+00:00",
   "entries": [
     {
       "domain": "bremen.de",
@@ -10,6 +10,28 @@
       "source": "coordinator",
       "meta": {
         "candidate": "Repair Cafés in Bremen - Wegwerfen kann doch jeder!"
+      }
+    },
+    {
+      "domain": "cciz.de",
+      "url": "https://www.cciz.de/2025/09/repaircafe-im-september-3",
+      "reason": "Bereits angeschrieben (Einladung gesendet).",
+      "tag": "contacted",
+      "added_at": "2025-12-16T07:12:30+00:00",
+      "source": "pipeline",
+      "meta": {
+        "letter_path": "outputs\\letters\\repaircaf-im-september.md"
+      }
+    },
+    {
+      "domain": "chaostreff-flensburg.de",
+      "url": "https://chaostreff-flensburg.de/events/2022/hacks-on-the-beach-2022",
+      "reason": "Bereits angeschrieben (Einladung gesendet).",
+      "tag": "contacted",
+      "added_at": "2025-12-16T07:10:04+00:00",
+      "source": "pipeline",
+      "meta": {
+        "letter_path": "outputs\\letters\\hacks-on-the-beach-2022.md"
       }
     },
     {
@@ -120,6 +142,28 @@
       "source": "coordinator",
       "meta": {
         "candidate": "Clubräume"
+      }
+    },
+    {
+      "domain": "wiki.hackerspaces.org",
+      "url": "https://wiki.hackerspaces.org/Schleswig-Holstein",
+      "reason": "Verzeichnis‑/Wiki‑Seite, keine eigenständige Organisation, nicht geeignet für gezielte Kontaktaufnahme.",
+      "tag": "coordinator",
+      "added_at": "2025-12-16T07:08:27+00:00",
+      "source": "coordinator",
+      "meta": {
+        "candidate": "Schleswig-Holstein - HackerspaceWiki"
+      }
+    },
+    {
+      "domain": "zero-waste-itzehoe.de",
+      "url": "https://zero-waste-itzehoe.de/repair-cafe",
+      "reason": "Bereits angeschrieben (Einladung gesendet).",
+      "tag": "contacted",
+      "added_at": "2025-12-16T07:11:51+00:00",
+      "source": "pipeline",
+      "meta": {
+        "letter_path": "outputs\\letters\\itzehoer-repaircaf.md"
       }
     }
   ]

@@ -1,16 +1,17 @@
 """
-Planner -> Google-/DuckDuckGo-Suche -> Evaluator -> Writer Pipeline.
+Automatisierte Recherche- und Outreach-Pipeline.
 
-Der Workflow läuft vollständig automatisiert:
-- Planner erstellt einen strukturierten Plan inklusive Suchqueries.
-- Standardmäßig liefert Google Custom Search die Treffer; fehlt die Google-Konfiguration,
-  fällt der Workflow automatisch auf DuckDuckGo zurück.
-- Ein Evaluator-Agent filtert ungeeignete Kandidaten und liefert Feedback.
-- Bei Bedarf generiert ein Query-Refiner neue Suchen, bis genügend Kandidaten akzeptiert sind.
-- Akzeptierte Kandidaten werden via NorthData angereichert und in Anschreiben überführt.
+Steuerung:
+- `config/brief.yaml` definiert Auftrag, Zielprofil und Template-Pfad.
+- `config/outreach_template.md` ist die Vorlage, die der Writer personalisiert.
 
-Zwischenstände (Suche, Evaluationsentscheidungen, NorthData-Ergebnisse) werden persistiert,
-so dass der Ablauf auditierbar bleibt.
+Workflow (high level):
+- Planner erzeugt Schritte + Suchqueries.
+- Suche via WebSearchTool (falls verfügbar) oder Google/DuckDuckGo-Fallback.
+- ResultFilter/Evaluator/Coordinator priorisieren passende Kandidaten.
+- Site-Scraper sammelt Kontext + Kontaktmails; optional NorthData als Zusatzsignal.
+- Profile-Enricher erzeugt strukturierte Profile (JSON), Writer + QA generieren Entwürfe.
+- Zwischenergebnisse werden gespeichert (u. a. `data/staging/*`, `outputs/*`, `logs/pipeline.log`).
 """
 
 from __future__ import annotations
@@ -37,6 +38,8 @@ from tools.identity_loader import get_identity_summary, load_identity
 from tools.blacklist import BlacklistManager
 from tools.org_registry import OrganizationRegistry
 from tools.directory_parser import DirectoryEntry, DirectoryParserError, expand_directory
+from workflows.brief import DEFAULT_BRIEF_PATH, CampaignBrief, load_campaign_brief, load_message_template
+from workflows.settings import PipelineSettings, load_pipeline_settings
 from tools.google_search import (
     GoogleSearchResult,
     iter_queries,
@@ -56,16 +59,19 @@ from tools.northdata import (
     format_top_suggestion,
     store_suggestions,
 )
-from tools.site_scraper import SiteSnapshot, fetch_site_snapshot, fetch_related_snapshots
+from tools.site_scraper import ContactInfo, SiteSnapshot, fetch_site_snapshot, fetch_related_snapshots
 from tools.web_search_agent import run_web_search_agent
 
 
 STAGING_NOTES = Path("data/staging/research_notes.md")
 STAGING_ACCEPTED = Path("data/staging/candidates_selected.json")
 OUTPUT_DIR = Path("outputs/letters")
+PROFILES_DIR = Path("outputs/profiles")
 LOG_DIR = Path("logs")
 PIPELINE_LOG = LOG_DIR / "pipeline.log"
 ENV_PATH = Path(".env")
+STOP_FILE_DEFAULT = Path("data/staging/stop.flag")
+LAST_RUN_PATH = Path("data/staging/last_run.json")
 
 # Disable tracing to avoid noisy warnings when no tracing key is configured.
 set_tracing_disabled(True)
@@ -74,14 +80,15 @@ set_tracing_disabled(True)
 def console(message: str) -> None:
     print(f"[PIPELINE] {message}")
 
-DEFAULT_TARGET_CANDIDATES = 50
+DEFAULT_TARGET_CANDIDATES = 5
 DEFAULT_MAX_ITERATIONS = 10
 DEFAULT_MAX_RESULTS_PER_QUERY = 10
 EVALUATION_ACCEPT_THRESHOLD = 0.62
 NORTHDATA_COUNTRIES = "DE"
 MAX_QA_RETRIES = 3
-MAX_LETTER_WORDS = 190
 DUCKDUCKGO_QUERY_DELAY = 2.5
+DEFAULT_SEARCH_RETRIES = 2
+DEFAULT_SEARCH_RETRY_BACKOFF = 3.0
 PROMISE_PATTERNS = [
     r"\bversprech",
     r"\bgarantier",
@@ -89,8 +96,8 @@ PROMISE_PATTERNS = [
     r"\bsichern\s+zu",
     r"\bdefinitiv\b",
 ]
-NEGATIVE_URL_SUFFIXES = (".pdf", ".csv", ".doc", ".ppt", ".xls", ".zip")
-NEGATIVE_DOMAINS = {
+DEFAULT_NEGATIVE_URL_SUFFIXES = (".pdf", ".csv", ".doc", ".ppt", ".xls", ".zip")
+DEFAULT_NEGATIVE_DOMAINS = {
     "bundestag.de",
     "scribd.com",
     "editeur.org",
@@ -99,36 +106,6 @@ NEGATIVE_DOMAINS = {
     "bne-portal.de",
     "schleswig-holstein.de",
 }
-NEGATIVE_TEXT_TERMS = [
-    "outlet",
-    "shopping center",
-    "shopping-centre",
-    "bank",
-    "sparkasse",
-    "versicher",
-    "immobilien",
-    "wohnungsbau",
-    "stiftung",
-    "gmbh",
-    "aktiengesellschaft",
-    "investment",
-    "einkaufszentrum",
-]
-SEARCH_FOCUS_KEYWORDS = [
-    "verein",
-    "e.v.",
-    "makerspace",
-    "hackerspace",
-    "labor",
-    "offene werkstatt",
-    "repair café",
-    "repair cafe",
-    "gemeinnützig",
-    "gemeinnuetzig",
-    "open lab",
-    "fablab",
-    "maker",
-]
 NORD_REGION_KEYWORDS = [
     "norddeutsch",
     "schleswig",
@@ -181,11 +158,6 @@ OFF_REGION_KEYWORDS = [
     "nürnberg",
     "nuernberg",
 ]
-TARGET_PROFILE_DESCRIPTION = (
-    "Fokus auf nicht-kommerzielle Maker:innen, Hackervereine, offene Werkstätten, Kultur-"
-    "und Technik-Kollektive (z. B. Chaotikum, Fuchsbau) aus Norddeutschland. "
-    "Bevorzugt Projekte mit Mitmach-Charakter, Bildungsschwerpunkt oder DIY-Kultur."
-)
 WEB_SEARCH_LOCATION = "Norddeutschland (Lübeck, Hamburg, Kiel, Bremen)"
 DIRECTORY_HINT_KEYWORDS = [
     "liste",
@@ -217,25 +189,55 @@ DIRECTORY_HINT_KEYWORDS = [
 DIRECTORY_EXPANSION_MIN_SCORE = 0.5
 DIRECTORY_MAX_ENTRIES = 25
 DIRECTORY_MAX_DEPTH = 2
-REGIONAL_QUERY_PERMUTATIONS = [
-    "Makerspace Hamburg gemeinnützig",
-    "Offene Werkstatt Kiel Verein",
-    "Hackerspace Bremen e.V.",
-    "DIY Labor Lübeck",
-    "Kreativlabor Niedersachsen Schule",
-    "Open Lab Flensburg Universität",
-    "Freies Labor Schleswig-Holstein",
-    "Maker Kollektiv Rostock",
-    "Reparatur Café Norddeutschland",
-    "Community Werkstatt Mecklenburg",
-]
-DEFAULT_MAX_LETTERS = 3
+PARTNER_LINK_LIMIT = 5
 DEFAULT_PHASE = "acquire"
 DEFAULT_REGION = "nord"  # placeholder for macro areas
 
 
-def fallback_region_queries(used_queries: Iterable[str], missing: int, region: str = DEFAULT_REGION) -> List[str]:
-    pool = REGIONAL_QUERY_SETS.get(region.lower(), REGIONAL_QUERY_PERMUTATIONS)
+def generate_region_queries(brief: CampaignBrief, region: str, *, limit: int = 10) -> List[str]:
+    region_hint = (region or "").strip()
+    if not region_hint or region_hint.lower() in {"any", "all", "global", "world"}:
+        return []
+    region_hint = region_hint.replace("-", " ").strip()
+
+    terms: List[str] = []
+    if brief.focus_areas:
+        terms.extend([area.strip() for area in brief.focus_areas[:3] if area.strip()])
+    if brief.search_focus_keywords:
+        terms.extend([kw.strip() for kw in brief.search_focus_keywords[:3] if kw.strip()])
+    if not terms:
+        return []
+
+    proposals: List[str] = []
+    for term in terms:
+        proposals.append(f"{region_hint} {term}")
+        proposals.append(f"{region_hint} {term} Kontakt E-Mail")
+        proposals.append(f"{region_hint} {term} Ansprechpartner E-Mail")
+        if len(proposals) >= limit:
+            break
+
+    unique: List[str] = []
+    seen: set[str] = set()
+    for query in proposals:
+        key = query.lower().strip()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        unique.append(query)
+        if len(unique) >= limit:
+            break
+    return unique
+
+
+def fallback_region_queries(
+    used_queries: Iterable[str],
+    missing: int,
+    region: str,
+    brief: CampaignBrief,
+) -> List[str]:
+    pool = generate_region_queries(brief, region, limit=14)
+    if not pool:
+        return []
     remaining = max(1, min(len(pool), max(missing, 5)))
     used = set(q.lower() for q in used_queries)
     candidates: List[str] = []
@@ -260,17 +262,27 @@ def get_int_setting(name: str, default: int) -> int:
         return default
 
 
-def should_skip_url(url: str) -> bool:
+def should_skip_url(url: str, brief: CampaignBrief) -> bool:
     lowered = url.lower()
-    if any(lowered.endswith(suffix) for suffix in NEGATIVE_URL_SUFFIXES):
+    suffixes = {suffix.lower() for suffix in (brief.exclude_url_suffixes or [])} | {
+        suffix.lower() for suffix in DEFAULT_NEGATIVE_URL_SUFFIXES
+    }
+    if any(lowered.endswith(suffix) for suffix in suffixes):
         return True
     domain = urlparse(url).netloc.lower()
-    if any(domain.endswith(neg) for neg in NEGATIVE_DOMAINS):
+    blocked_domains = {neg.lower() for neg in (brief.exclude_domains or [])} | {
+        neg.lower() for neg in DEFAULT_NEGATIVE_DOMAINS
+    }
+    if any(domain.endswith(neg) for neg in blocked_domains):
         return True
     return False
 
 
 def candidate_matches_region(candidate: CandidateInfo, region: str) -> bool:
+    if not region:
+        return True
+    if region.strip().lower() in {"any", "all", "global", "world"}:
+        return True
     text = (_candidate_text(candidate) + " " + candidate.source_query).lower()
     positives = NORD_REGION_KEYWORDS + REGION_POSITIVE_KEYWORDS.get(region.lower(), [])
     if any(keyword in text for keyword in OFF_REGION_KEYWORDS):
@@ -281,7 +293,7 @@ def candidate_matches_region(candidate: CandidateInfo, region: str) -> bool:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Recherche-Pipeline für Maker Faire Lübeck")
+    parser = argparse.ArgumentParser(description="Recherche- und Outreach-Pipeline")
     parser.add_argument(
         "--phase",
         choices=["explore", "refine", "acquire"],
@@ -292,6 +304,11 @@ def parse_args() -> argparse.Namespace:
         "--region",
         default=os.environ.get("PIPELINE_REGION", DEFAULT_REGION),
         help="Makroregion (z. B. nord, hamburg, luebeck, kiel, hannover).",
+    )
+    parser.add_argument(
+        "--brief",
+        default=os.environ.get("PIPELINE_BRIEF", str(DEFAULT_BRIEF_PATH)),
+        help="Pfad zum Briefing YAML (Standard: config/brief.yaml).",
     )
     parser.add_argument(
         "--max-iterations",
@@ -321,6 +338,23 @@ def parse_args() -> argparse.Namespace:
         nargs="?",
         const=str(STAGING_ACCEPTED),
         help="Überspringt die Websuche und lädt akzeptierte Kandidaten aus der angegebenen Snapshot-Datei (Standard: data/staging/candidates_selected.json).",
+    )
+    parser.add_argument(
+        "--stop-file",
+        default=str(STOP_FILE_DEFAULT),
+        help="Wenn diese Datei existiert, werden keine neuen Such-/Scrape-Aufgaben mehr gestartet (laufende Tasks beenden sauber).",
+    )
+    parser.add_argument(
+        "--search-retries",
+        type=int,
+        default=os.environ.get("PIPELINE_SEARCH_RETRIES"),
+        help="Anzahl Wiederholungen pro Query bei Suchfehlern.",
+    )
+    parser.add_argument(
+        "--search-retry-backoff",
+        type=float,
+        default=os.environ.get("PIPELINE_SEARCH_BACKOFF"),
+        help="Backoff (Sekunden) zwischen Such-Retries.",
     )
     return parser.parse_args()
 
@@ -359,45 +393,6 @@ def phase_presets(phase: str) -> dict:
         "letters_per_run": 3,
     }
 
-
-REGIONAL_QUERY_SETS = {
-    "nord": REGIONAL_QUERY_PERMUTATIONS,
-    "hamburg": [
-        "Makerspace Hamburg gemeinnützig",
-        "Open Lab Hamburg Hochschule",
-        "Hamburg DIY Kollektiv nicht kommerziell",
-        "Fab City Hamburg Werkstatt",
-    ],
-    "luebeck": [
-        "Lübeck offene Werkstatt",
-        "Maker Lübeck Verein",
-        "Lübeck Kulturtechnik Kollektiv",
-        "Offene Werkstatt Bad Schwartau",
-        "Gemeinschaftsprojekt Travemünde",
-        "Maker Ostholstein",
-    ],
-    "kiel": [
-        "Kiel Makerspace",
-        "Kiel Open Lab Schule",
-        "Kiel Hackerspace Verein",
-        "Offene Werkstatt Eckernförde",
-        "Rendsburg DIY Verein",
-    ],
-    "luebeck-local": [
-        "Lübeck Makerspace",
-        "Arfrade Hofprojekt",
-        "Bad Oldesloe offene Werkstatt",
-        "Reparatur Café Lübeck",
-        "Schwartau DIY", 
-        "Travemünde Maker",
-        "Neustadt in Holstein Werkstatt",
-    ],
-    "hannover": [
-        "Hannover Kreativlabor",
-        "Hackerspace Hannover",
-        "FabLab Hannover",
-    ],
-}
 @dataclass
 class PlannerPlan:
     steps: List[str]
@@ -412,10 +407,13 @@ class EvaluationResult:
     reason: str
     search_adjustment: str
     category: str = ""
+    org_type: str = ""
+    org_size: str = ""
     region_hint: str = ""
     nonprofit: bool = False
     maker_focus: bool = False
     outreach_priority: float = 0.0
+    contact_quality: float = 0.0
 
 
 @dataclass
@@ -444,6 +442,8 @@ class CandidateInfo:
     duplicate_reason: str = ""
     letter_status: str = "pending"
     letter_path: str = ""
+    profile_path: str = ""
+    contacts: List[ContactInfo] = field(default_factory=list)
 
     def as_markdown(self) -> str:
         base = (
@@ -453,8 +453,23 @@ class CandidateInfo:
             f"- Kurzbeschreibung: {self.summary or self.snippet}\n"
             f"- Bewertung: {self.notes or (self.evaluation.reason if self.evaluation else 'Noch nicht bewertet')}\n"
         )
+        if self.evaluation:
+            base += f"- Score: {self.evaluation.score:.2f}\n"
+            if self.evaluation.category:
+                base += f"- Kategorie: {self.evaluation.category}\n"
+            if self.evaluation.org_type or self.evaluation.org_size:
+                base += f"- Typ/Größe: {self.evaluation.org_type or '—'} / {self.evaluation.org_size or '—'}\n"
+            if self.evaluation.contact_quality:
+                base += f"- Kontaktqualität: {self.evaluation.contact_quality:.2f}\n"
+        if self.contacts:
+            emails = ", ".join(contact.email for contact in self.contacts[:4])
+            base += f"- Kontakt: {emails}\n"
         if self.northdata_info:
             base += f"- NorthData: {self.northdata_info}\n"
+        if self.profile_path:
+            base += f"- Profil: {self.profile_path}\n"
+        if self.letter_path:
+            base += f"- Letter: {self.letter_path} ({self.letter_status})\n"
         return base
 
 
@@ -514,6 +529,25 @@ class QAResult:
 class CandidateContext:
     primary: Optional[SiteSnapshot]
     related: List[SiteSnapshot] = field(default_factory=list)
+    contacts: List[ContactInfo] = field(default_factory=list)
+    partner_links: List[str] = field(default_factory=list)
+
+
+class FeedbackBus:
+    def __init__(self, limit: int = 30) -> None:
+        self.limit = limit
+        self._hints: List[str] = []
+
+    def add(self, hint: str) -> None:
+        text = (hint or "").strip()
+        if not text:
+            return
+        self._hints.append(text)
+        if len(self._hints) > self.limit:
+            self._hints = self._hints[-self.limit :]
+
+    def recent(self, n: int = 10) -> List[str]:
+        return self._hints[-n:]
 
 
 class SearchResult(Protocol):
@@ -578,6 +612,78 @@ def append_log(event: str, **fields: object) -> None:
         handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
 
+def store_last_run_summary(
+    *,
+    brief_path: Path,
+    brief: CampaignBrief,
+    phase: str,
+    region: str,
+    plan: PlannerPlan,
+    accepted: Sequence[CandidateInfo],
+    all_candidates: Sequence[CandidateInfo],
+    backend: str,
+    empty_searches: int,
+    letter_stats: dict[str, int],
+    contacts_export: Optional[Path],
+) -> None:
+    letters_done = int(letter_stats.get("completed", 0) or 0)
+    candidates_payload = [
+        {
+            "name": c.name,
+            "url": c.url,
+            "org_slug": c.org_slug,
+            "letter_status": c.letter_status,
+            "letter_path": c.letter_path,
+            "emails": [contact.email for contact in (c.contacts or [])],
+            "score": (c.evaluation.score if c.evaluation else None),
+            "category": (c.evaluation.category if c.evaluation else ""),
+            "org_type": (c.evaluation.org_type if c.evaluation else ""),
+        }
+        for c in accepted[:50]
+    ]
+    payload = {
+        "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "brief_path": str(brief_path),
+        "brief": {
+            "task": brief.task,
+            "target_profile": brief.target_profile,
+            "focus_areas": brief.focus_areas,
+            "template_path": brief.message_template_path,
+            "language": brief.language,
+            "commercial_mode": brief.commercial_mode,
+            "require_contact_email": brief.require_contact_email,
+            "max_message_words": brief.max_message_words,
+        },
+        "run": {
+            "phase": phase,
+            "region": region,
+            "target_candidates": plan.target_candidates,
+            "accepted": len(accepted),
+            "considered": len(all_candidates),
+            "letters_done": letters_done,
+            "backend": backend,
+            "empty_searches": empty_searches,
+        },
+        "artifacts": {
+            "snapshot": str(STAGING_ACCEPTED),
+            "notes": str(STAGING_NOTES),
+            "log": str(PIPELINE_LOG),
+            "contacts_csv": str(contacts_export) if contacts_export else "",
+        },
+        "accepted_preview": candidates_payload,
+    }
+    LAST_RUN_PATH.parent.mkdir(parents=True, exist_ok=True)
+    LAST_RUN_PATH.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+class StopSignal:
+    def __init__(self, path: Optional[Path]) -> None:
+        self.path = path
+
+    def triggered(self) -> bool:
+        return bool(self.path and self.path.exists())
+
+
 def word_count(text: str) -> int:
     return len([token for token in re.split(r"\s+", text.strip()) if token])
 
@@ -615,30 +721,34 @@ def extract_json_block(text: str) -> str:
 
 
 async def run_planner(
-    model: OpenAIChatCompletionsModel, task: str, identity_summary: str
+    model: OpenAIChatCompletionsModel,
+    *,
+    brief: CampaignBrief,
+    identity_summary: str,
+    region: str,
 ) -> tuple[PlannerPlan, str]:
     console("Starte Planner-Aufruf ...")
     agent = Agent(
         name="Planner",
         instructions=(
-            "Du planst eine Recherche nach Ausstellenden für die Maker Faire Lübeck 2026. "
-            "Zielgruppe: nicht-kommerzielle Maker:innen, Hackerspaces, offene Werkstätten, Kultur- "
-            "und Bildungskollektive (z. B. Chaotikum, Fuchsbau) aus Norddeutschland."
+            "Du planst eine Web-Recherche, um passende Gegenueber fuer einen Outreach-Auftrag zu finden. "
             "Gib ausschließlich JSON zurück mit den Feldern:\n"
             '{"plan_steps": ["Schritt 1", ...], "search_queries": ["query1", ...], "target_candidates": 50}\n'
-            "Die Suchqueries sollen konkrete Websuchen für passende Maker-/Technikprojekte sein. "
-            "Erzeuge mindestens 5 Queries. Verwende keine doppelten Werte.\n"
+            "Die Suchqueries sollen konkrete Websuchen fuer passende Gegenueber zum Auftrag sein. "
+            "Erzeuge mindestens 5 Queries. Verwende keine doppelten Werte und keine extrem langen Queries.\n"
             "Gib nur JSON zurück, kein Fließtext."
         ),
         model=model,
     )
+    focus = ", ".join(brief.focus_areas) if brief.focus_areas else "—"
     prompt = (
         "Auftrag:\n"
-        f"{task}\n\n"
+        f"{brief.task}\n\n"
         "Identität des Auftraggebers:\n"
         f"{identity_summary}\n"
-        "Gesuchtes Profil:\n"
-        f"{TARGET_PROFILE_DESCRIPTION}\n"
+        f"Region-Fokus: {region}\n"
+        f"Fokus-Themen: {focus}\n\n"
+        f"Gesuchtes Profil:\n{brief.target_profile}\n"
         "Erstelle Rechercheplan."
     )
     result = await Runner.run(agent, prompt)
@@ -655,7 +765,7 @@ async def run_planner(
         target = DEFAULT_TARGET_CANDIDATES
 
     if len(queries) < 3:
-        queries.extend(DEFAULT_FALLBACK_QUERIES)
+        queries.extend(generate_fallback_queries(brief, region))
 
     console(
         f"Planner lieferte {len(steps or [])} Schritte, {len(queries)} Queries, Ziel {target} Kandidaten."
@@ -664,30 +774,61 @@ async def run_planner(
 
 
 DEFAULT_PLAN_STEPS = [
-    "Thematische Schwerpunkte und Zielgruppen klären.",
-    "Passende Maker-/Technikprojekte online recherchieren.",
-    "Treffer bewerten, anreichern und zur Ansprache vorbereiten.",
+    "Zielgruppe, Kriterien und Randbedingungen klären.",
+    "Passende Gegenüber online recherchieren und priorisieren.",
+    "Treffer bewerten, anreichern und Outreach-Entwürfe erstellen.",
 ]
 
-DEFAULT_FALLBACK_QUERIES = [
-    "Chaotikum Hackerspace Projekte Lübeck",
-    "Fuchsbau Lübeck DIY Kollektiv",
-    "Offene Werkstatt Schleswig-Holstein gemeinnützig",
-    "Hackerverein Hamburg non-profit",
-    "Freies Labor Kiel Maker Projekte",
-    "DIY Elektronik Verein Bremen",
-    "Jugend hackt Club Norddeutschland",
-]
+def generate_fallback_queries(brief: CampaignBrief, region: str) -> List[str]:
+    region_hint = region.strip()
+    if region_hint.lower() in {"any", "all", "global", "world"}:
+        region_hint = ""
+    region_hint = region_hint.replace("-", " ").strip()
+
+    seeds: List[str] = []
+    if brief.focus_areas:
+        seeds.extend([area.strip() for area in brief.focus_areas if area.strip()])
+    if brief.search_focus_keywords:
+        seeds.extend([kw.strip() for kw in brief.search_focus_keywords[:4] if kw.strip()])
+    if not seeds:
+        seeds = ["Kontakt", "Impressum", "E-Mail"]
+
+    proposals: List[str] = []
+    for seed in seeds:
+        base = seed.strip()
+        if not base:
+            continue
+        if region_hint:
+            proposals.append(f"{region_hint} {base} Kontakt E-Mail")
+        else:
+            proposals.append(f"{base} Kontakt E-Mail")
+        proposals.append(f"{base} Impressum E-Mail")
+        proposals.append(f"{base} Ansprechpartner E-Mail")
+        if len(proposals) >= 8:
+            break
+
+    unique: List[str] = []
+    seen: set[str] = set()
+    for query in proposals:
+        key = query.lower().strip()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        unique.append(query)
+        if len(unique) >= 6:
+            break
+    return unique
 
 
 def build_candidates_from_search(
-    query: str, results: Sequence[SearchResult]
+    query: str, results: Sequence[SearchResult], *, brief: CampaignBrief
 ) -> List[CandidateInfo]:
     candidates: List[CandidateInfo] = []
+    exclude_terms = {term.lower() for term in (brief.exclude_text_terms or []) if term.strip()}
     for item in results:
         if not item.url:
             continue
-        if should_skip_url(item.url):
+        if should_skip_url(item.url, brief):
             append_log(
                 "search.filtered",
                 url=item.url,
@@ -696,7 +837,7 @@ def build_candidates_from_search(
             continue
         title = item.title or item.url
         combined_text = f"{title} {item.snippet}".lower()
-        if any(term in combined_text for term in NEGATIVE_TEXT_TERMS):
+        if exclude_terms and any(term in combined_text for term in exclude_terms):
             append_log(
                 "search.filtered",
                 url=item.url,
@@ -718,6 +859,7 @@ def build_candidates_from_search(
 async def filter_search_results(
     model: OpenAIChatCompletionsModel,
     identity_summary: str,
+    brief: CampaignBrief,
     query: str,
     results: Sequence[SearchResult],
 ) -> Sequence[SearchResult]:
@@ -726,10 +868,10 @@ async def filter_search_results(
     agent = Agent(
         name="ResultFilter",
         instructions=(
-            "Du bist ein Recherche-Koordinator. Entferne Duplikate (gleiche Domains), "
-            "rein kommerzielle Shops und reine Verzeichnis-/Newsseiten. "
-            "Behalte höchstens 6 Ergebnisse pro Query und markiere ggf. interessante Unterseiten "
-            "(z. B. /kontakt, /about). "
+            "Du bist ein Recherche-Koordinator. Entferne Duplikate (gleiche Domains), offensichtlichen Spam "
+            "und reine Verzeichnis-/Newsseiten. "
+            "Behalte höchstens 6 Ergebnisse pro Query. Bevorzuge echte Projekt-/About-/Kontakt-Seiten, die "
+            "zum Auftrag/Zielprofil passen. "
             "Antwort nur als JSON: "
             '{"keep_indexes": [0,2,...], "notes": "..."}'
         ),
@@ -746,6 +888,8 @@ async def filter_search_results(
     ]
     prompt = (
         f"Identität:\n{identity_summary}\n\n"
+        f"Auftrag:\n{brief.task}\n\n"
+        f"Zielprofil:\n{brief.target_profile}\n\n"
         f"Query: {query}\n"
         "Suchergebnisse:\n"
         + json.dumps(serialized, ensure_ascii=False, indent=2)
@@ -778,6 +922,19 @@ def candidate_from_directory_entry(
         summary=summary,
         source_query=f"directory:{parent.url}",
         snippet=summary,
+    )
+
+
+def candidate_from_partner_link(parent: CandidateInfo, url: str) -> CandidateInfo:
+    parsed = urlparse(url)
+    hostname = parsed.netloc.replace("www.", "")
+    name = hostname.split(":")[0] or url
+    return CandidateInfo(
+        name=name,
+        url=url,
+        summary=f"Gefunden als Partner-/Netzwerk-Link auf {parent.url}",
+        source_query=f"partner:{parent.url}",
+        snippet="",
     )
 
 
@@ -927,6 +1084,14 @@ def load_candidates_from_snapshot(path: Path) -> List[CandidateInfo]:
                 accepted=bool(evaluation_data.get("accepted", False)),
                 reason=str(evaluation_data.get("reason", "")),
                 search_adjustment=str(evaluation_data.get("search_adjustment", "")),
+                category=str(evaluation_data.get("category", "") or ""),
+                org_type=str(evaluation_data.get("org_type", "") or ""),
+                org_size=str(evaluation_data.get("org_size", "") or ""),
+                region_hint=str(evaluation_data.get("region_hint", "") or ""),
+                nonprofit=bool(evaluation_data.get("nonprofit", False)),
+                maker_focus=bool(evaluation_data.get("maker_focus", False)),
+                outreach_priority=float(evaluation_data.get("outreach_priority", 0.0) or 0.0),
+                contact_quality=float(evaluation_data.get("contact_quality", 0.0) or 0.0),
             )
         candidate = CandidateInfo(
             name=entry.get("name", ""),
@@ -939,14 +1104,31 @@ def load_candidates_from_snapshot(path: Path) -> List[CandidateInfo]:
             org_slug=entry.get("org_slug", ""),
             letter_status=entry.get("letter_status", "pending"),
             letter_path=entry.get("letter_path", ""),
+            profile_path=entry.get("profile_path", ""),
         )
+        contacts: List[ContactInfo] = []
+        for contact in entry.get("contacts", []) or []:
+            if not isinstance(contact, dict):
+                continue
+            email = contact.get("email")
+            if not email:
+                continue
+            contacts.append(
+                ContactInfo(
+                    email=email,
+                    name=contact.get("name", ""),
+                    context=contact.get("context", ""),
+                    source_url=contact.get("source_url", candidate.url),
+                )
+            )
+        candidate.contacts = dedupe_contacts(contacts)
         candidate.evaluation = evaluation
         candidates.append(candidate)
     return candidates
 
 
-def extend_plan_with_region(plan: PlannerPlan, region: str) -> None:
-    region_queries = REGIONAL_QUERY_SETS.get(region.lower())
+def extend_plan_with_region(plan: PlannerPlan, region: str, brief: CampaignBrief) -> None:
+    region_queries = generate_region_queries(brief, region, limit=10)
     if not region_queries:
         return
     existing = set(q.lower() for q in plan.search_queries)
@@ -956,36 +1138,44 @@ def extend_plan_with_region(plan: PlannerPlan, region: str) -> None:
         console(f"Region '{region}' Queries hinzugefügt: {additions}")
 
 
-def enforce_focus_keywords(queries: Sequence[str]) -> List[str]:
+def enforce_focus_keywords(queries: Sequence[str], brief: CampaignBrief) -> List[str]:
+    keywords = [keyword.strip().lower() for keyword in (brief.search_focus_keywords or []) if keyword.strip()]
+    if not keywords:
+        return list(queries)
+    suffix = " ".join((brief.search_focus_keywords or [])[:2]).strip()
     normalized: List[str] = []
     for query in queries:
         lowered = query.lower()
-        if any(keyword in lowered for keyword in SEARCH_FOCUS_KEYWORDS):
+        if any(keyword in lowered for keyword in keywords):
             normalized.append(query)
         else:
-            normalized.append(f"{query} Makerspace Verein")
+            normalized.append(f"{query} {suffix}".strip() if suffix else query)
     return normalized
 
 
 async def evaluate_candidate(
     model: OpenAIChatCompletionsModel,
     identity_summary: str,
+    brief: CampaignBrief,
     candidate: CandidateInfo,
     context: Optional[CandidateContext],
+    *,
+    region: str,
 ) -> EvaluationResult:
     console(f"Bewerte Kandidat: {candidate.name} ({candidate.url}) ...")
     agent = Agent(
         name="Evaluator",
         instructions=(
-            "Bewerte, ob ein Projekt/Organisation zu einer Maker Faire passt. "
-            "Bevorzuge nicht-kommerzielle Kollektive, offene Werkstätten, Hackerspaces, "
-            "Schul-/Uni-Teams und DIY-Kulturschaffende aus Norddeutschland. "
-            "Warnung: Reine Verzeichnisse/Sammelseiten (z. B. Listen, Übersichten, Guides) dürfen nicht akzeptiert werden; fordere stattdessen konkrete Gruppen mit eigener Kontaktmöglichkeit. "
+            "Bewerte, ob der Kandidat zum Auftrag und Zielprofil passt. "
+            "Warnung: Reine Verzeichnisse/Sammelseiten (z. B. Listen, Übersichten, Guides) dürfen nicht akzeptiert werden; "
+            "bevorzuge stattdessen konkrete Gruppen/Organisationen mit eigener Kontaktmöglichkeit. "
             "Antworte ausschließlich als JSON mit Feldern:\n"
             '{"score": 0.0-1.0, "accepted": true/false, "reason": "...", "search_adjustment": "...", '
-            '"category": "verein|schule|directory|kommerziell|event|sonstiges", '
-            '"region_hint": "...", "nonprofit": true/false, "maker_focus": true/false, "outreach_priority": 0.0-1.0}\n'
-            "score beschreibt die Passung (>=0.62 akzeptiert). "
+            '"category": "kurzes label", "org_type": "verein|firma|einzelperson|schule|uni|kollektiv|oeffentlich|unbekannt", '
+            '"org_size": "solo|klein|mittel|gross|unbekannt", "region_hint": "...", '
+            '"nonprofit": true/false, "maker_focus": true/false, '
+            '"outreach_priority": 0.0-1.0, "contact_quality": 0.0-1.0}\n'
+            "score beschreibt die Passung (>=0.62 wird typischerweise akzeptiert). "
             '"search_adjustment" enthält einen Hinweis, wie künftige Queries präzisiert werden können '
             "(z. B. \"mehr Bildungspartner\" oder \"weniger reine Händler\"). "
             "Wenn kein Hinweis nötig ist, verwende einen leeren String."
@@ -993,11 +1183,14 @@ async def evaluate_candidate(
         model=model,
     )
     context_block = format_context_for_prompt(context)
+    focus = ", ".join(brief.focus_areas) if brief.focus_areas else "—"
     prompt = (
         "Identität des Auftraggebers:\n"
         f"{identity_summary}\n\n"
-        "Gesuchtes Profil:\n"
-        f"{TARGET_PROFILE_DESCRIPTION}\n\n"
+        f"Auftrag:\n{brief.task}\n\n"
+        f"Region-Fokus: {region}\n"
+        f"Fokus-Themen: {focus}\n\n"
+        f"Gesuchtes Profil:\n{brief.target_profile}\n\n"
         "Kandidat:\n"
         f"Name: {candidate.name}\n"
         f"URL: {candidate.url}\n"
@@ -1018,10 +1211,13 @@ async def evaluate_candidate(
             "reason": "Bewertung fehlgeschlagen.",
             "search_adjustment": "präzisere Suchbegriffe verwenden",
             "category": "unbekannt",
+            "org_type": "unbekannt",
+            "org_size": "unbekannt",
             "region_hint": "",
             "nonprofit": False,
             "maker_focus": False,
             "outreach_priority": 0.0,
+            "contact_quality": 0.0,
         }
 
     score = float(data.get("score", 0.0))
@@ -1037,10 +1233,13 @@ async def evaluate_candidate(
         reason=reason,
         search_adjustment=adjustment,
         category=str(data.get("category", "")).strip(),
+        org_type=str(data.get("org_type", "")).strip(),
+        org_size=str(data.get("org_size", "")).strip(),
         region_hint=str(data.get("region_hint", "")).strip(),
         nonprofit=bool(data.get("nonprofit", False)),
         maker_focus=bool(data.get("maker_focus", False)),
         outreach_priority=float(data.get("outreach_priority", 0.0) or 0.0),
+        contact_quality=float(data.get("contact_quality", 0.0) or 0.0),
     )
 
 
@@ -1102,6 +1301,7 @@ async def resolve_candidate_slug(
 async def coordinate_candidate(
     model: OpenAIChatCompletionsModel,
     identity_summary: str,
+    brief: CampaignBrief,
     candidate: CandidateInfo,
     evaluation: EvaluationResult,
     region: str,
@@ -1125,9 +1325,13 @@ async def coordinate_candidate(
     )
     evaluation_context = json.dumps(asdict(evaluation), ensure_ascii=False)
     context_block = format_context_for_prompt(context)
+    focus = ", ".join(brief.focus_areas) if brief.focus_areas else "—"
     prompt = (
         f"Identität:\n{identity_summary}\n\n"
+        f"Auftrag:\n{brief.task}\n\n"
+        f"Gesuchtes Profil:\n{brief.target_profile}\n\n"
         f"Region-Fokus: {region}\n"
+        f"Fokus-Themen: {focus}\n\n"
         "Research-Agent Beobachtung:\n"
         f"- Query: {candidate.source_query}\n"
         f"- Name: {candidate.name}\n"
@@ -1182,7 +1386,7 @@ async def coordinate_candidate(
 async def refine_queries(
     model: OpenAIChatCompletionsModel,
     identity_summary: str,
-    base_task: str,
+    brief: CampaignBrief,
     feedback_hints: Sequence[str],
     used_queries: Iterable[str],
     missing: int,
@@ -1195,8 +1399,7 @@ async def refine_queries(
     agent = Agent(
         name="QueryRefiner",
         instructions=(
-            "Erzeuge neue Suchqueries (Google Custom Search oder DuckDuckGo) für non-kommerzielle Maker:innen, "
-            "Hackspaces, offene Werkstätten, DIY-Kollektive und ähnliche Gruppen. "
+            "Erzeuge neue Suchqueries (Google Custom Search oder DuckDuckGo) passend zum Auftrag und Zielprofil. "
             "Nutze außerdem direkte Webseiten-Hinweise: Wenn du konkrete Vereine oder URLs kennst, füge sie unter "
             "\"direct_urls\" ein, dann crawlt das System diese Seiten direkt ohne Websuche. "
             "Antworte ausschließlich im JSON-Format: "
@@ -1205,10 +1408,13 @@ async def refine_queries(
         ),
         model=model,
     )
+    focus = ", ".join(brief.focus_areas) if brief.focus_areas else "—"
     prompt = (
-        f"Auftrag: {base_task}\n\n"
+        f"Auftrag: {brief.task}\n\n"
         "Identität:\n"
         f"{identity_summary}\n\n"
+        f"Region-Fokus: {region}\n"
+        f"Fokus-Themen: {focus}\n\n"
         f"Noch benötigte Kandidaten: {missing}\n"
         "Bereits verwendete Queries:\n"
         + "\n".join(f"- {query}" for query in used_queries)
@@ -1218,7 +1424,7 @@ async def refine_queries(
         + "\n\n"
         "Bereits akzeptierte Kandidaten (verwende Themen/Ortsangaben als Inspiration für neue Suchbegriffe oder Direktlinks):\n"
         f"{accepted_block}\n\n"
-        f"Gesuchtes Profil:\n{TARGET_PROFILE_DESCRIPTION}\n\n"
+        f"Gesuchtes Profil:\n{brief.target_profile}\n\n"
         "Erzeuge maximal 5 neue Queries und gib bei bekannten URLs (inkl. kurzer Zusammenfassung) Einträge in direct_urls zurück."
     )
     result = await Runner.run(agent, prompt)
@@ -1236,7 +1442,7 @@ async def refine_queries(
                 if candidate:
                     direct_urls.append(candidate)
     if not queries:
-        queries = fallback_region_queries(used_queries, missing, region)
+        queries = fallback_region_queries(used_queries, missing, region, brief)
     return queries, direct_urls
 
 
@@ -1309,6 +1515,36 @@ def store_research_notes(plan: PlannerPlan, planner_raw: str, accepted: Sequence
     STAGING_NOTES.write_text(content, encoding="utf-8")
 
 
+def export_contacts(accepted: Sequence[CandidateInfo]) -> Optional[Path]:
+    if not accepted:
+        return None
+    rows: List[str] = ["name,url,email,org_slug,notes"]
+    for candidate in accepted:
+        emails = candidate.contacts or []
+        if not emails:
+            continue
+        for contact in emails:
+            email = contact.email.replace(",", " ")
+            notes = (candidate.notes or "").replace(",", " ")
+            rows.append(
+                ",".join(
+                    [
+                        candidate.name.replace(",", " "),
+                        candidate.url,
+                        email,
+                        candidate.org_slug or "",
+                        notes,
+                    ]
+                )
+            )
+    if len(rows) == 1:
+        return None
+    export_path = Path("outputs") / "contacts.csv"
+    export_path.parent.mkdir(parents=True, exist_ok=True)
+    export_path.write_text("\n".join(rows), encoding="utf-8")
+    return export_path
+
+
 def slugify(value: str) -> str:
     normalized = (
         value.lower()
@@ -1326,6 +1562,7 @@ def store_letter(
     candidate: CandidateInfo, letter_content: str, qa_notes: str = ""
 ) -> Path:
     file_path = OUTPUT_DIR / f"{slugify(candidate.name)}.md"
+    contact_emails = ", ".join(contact.email for contact in candidate.contacts) if candidate.contacts else ""
     metadata_lines = [
         "---",
         f"generated_at: {datetime.now(timezone.utc).isoformat()}",
@@ -1333,6 +1570,8 @@ def store_letter(
         f"source_url: {candidate.url}",
         f"words: {word_count(letter_content)}",
     ]
+    if contact_emails:
+        metadata_lines.append(f"contact_emails: {contact_emails}")
     if qa_notes:
         metadata_lines.append(f"qa_notes: {qa_notes}")
     metadata_lines.append("---\n")
@@ -1353,6 +1592,15 @@ def format_snapshot_for_prompt(snapshot: Optional[SiteSnapshot]) -> str:
     if snapshot.highlights:
         highlight_lines = "\n".join(f"  * {text}" for text in snapshot.highlights)
         parts.append("- Highlights:\n" + highlight_lines)
+    if snapshot.contacts:
+        contact_lines = "\n".join(
+            f"  * {contact.email} ({contact.name or 'Kontakt'}, {contact.context or 'Quelle unbekannt'})"
+            for contact in snapshot.contacts
+        )
+        parts.append("- Kontakte:\n" + contact_lines)
+    if snapshot.links:
+        link_lines = "\n".join(f"  * {link}" for link in snapshot.links[:5])
+        parts.append("- Partner-/Netzwerk-Links (ausgehende Links):\n" + link_lines)
     return "\n".join(parts)
 
 
@@ -1364,54 +1612,219 @@ def format_context_for_prompt(context: Optional[CandidateContext]) -> str:
         parts.append("Hauptseite:\n" + format_snapshot_for_prompt(context.primary))
     for idx, snapshot in enumerate(context.related, start=1):
         parts.append(f"Subseite #{idx}:\n" + format_snapshot_for_prompt(snapshot))
+    if context.contacts:
+        contact_lines = "\n".join(
+            f"- {contact.email} ({contact.name or 'Kontakt'}, {contact.context or 'Quelle unbekannt'})"
+            for contact in context.contacts
+        )
+        parts.append("Gesammelte Kontakte:\n" + contact_lines)
+    if context.partner_links:
+        link_lines = "\n".join(f"- {link}" for link in context.partner_links[:8])
+        parts.append("Gefundene Partner-/Netzwerk-Links:\n" + link_lines)
     return "\n\n".join(part for part in parts if part)
 
 
+def dedupe_contacts(contacts: Iterable[ContactInfo]) -> List[ContactInfo]:
+    unique: List[ContactInfo] = []
+    seen: set[str] = set()
+    for contact in contacts:
+        email = contact.email.strip().lower()
+        if not email or email in seen:
+            continue
+        seen.add(email)
+        unique.append(contact)
+    return unique
+
+
+def dedupe_links(links: Iterable[str], base_url: str) -> List[str]:
+    base_domain = domain_key(base_url)
+    unique: List[str] = []
+    seen: set[str] = set()
+    for link in links:
+        normalized = link.rstrip("/")
+        if not normalized or normalized in seen:
+            continue
+        if domain_key(normalized) == base_domain:
+            continue
+        seen.add(normalized)
+        unique.append(normalized)
+        if len(unique) >= 12:
+            break
+    return unique
+
+
 def collect_candidate_context(candidate: CandidateInfo) -> CandidateContext:
-    primary = fetch_site_snapshot(candidate.url)
-    related = fetch_related_snapshots(candidate.url, max_pages=3)
-    return CandidateContext(primary=primary, related=related)
+    primary = fetch_site_snapshot(candidate.url, retries=1, backoff=2.0)
+    related = fetch_related_snapshots(candidate.url, max_pages=3, retries=1, backoff=2.0)
+    all_contacts: List[ContactInfo] = []
+    partner_links: List[str] = []
+    if primary:
+        all_contacts.extend(primary.contacts)
+        partner_links.extend(primary.links)
+    for snapshot in related:
+        all_contacts.extend(snapshot.contacts)
+        partner_links.extend(snapshot.links)
+    contacts = dedupe_contacts(all_contacts)
+    partner_links = dedupe_links(partner_links, base_url=candidate.url)
+    return CandidateContext(primary=primary, related=related, contacts=contacts, partner_links=partner_links)
+
+
+async def build_candidate_profile(
+    model: OpenAIChatCompletionsModel,
+    *,
+    identity_summary: str,
+    brief: CampaignBrief,
+    candidate: CandidateInfo,
+    context: Optional[CandidateContext],
+) -> dict[str, object]:
+    agent = Agent(
+        name="ProfileEnricher",
+        instructions=(
+            "Du extrahierst und normalisierst Informationen ueber das Gegenueber fuer Outreach. "
+            "Nutze die Webseiten-Snapshots, Notizen und vorhandene Kontakte. "
+            "Antworte ausschließlich als JSON im Schema:\n"
+            "{"
+            '"name": "...", "url": "...", '
+            '"org_type": "verein|firma|einzelperson|schule|uni|kollektiv|oeffentlich|unbekannt", '
+            '"org_size": "solo|klein|mittel|gross|unbekannt", '
+            '"category": "kurzes label", "location": "...", '
+            '"what_they_do": ["..."], "values": ["..."], '
+            '"contact_person": {"name": "...", "role": "..."}, '
+            '"contact_emails": ["..."], '
+            '"summary": "...", '
+            '"confidence": 0.0-1.0, '
+            '"missing": ["..."]'
+            "}\n"
+            "Wenn etwas unbekannt ist, nutze leere Strings/Listen und setze 'missing' entsprechend."
+        ),
+        model=model,
+    )
+    context_block = format_context_for_prompt(context)
+    contacts = candidate.contacts or (context.contacts if context else [])
+    contacts_block = ""
+    if contacts:
+        contact_lines = "\n".join(
+            f"- {c.email} ({c.name or 'Kontakt'}, {c.context or 'Quelle unbekannt'})"
+            for c in contacts[:6]
+        )
+        contacts_block = "Kontakte:\n" + contact_lines
+
+    evaluation_block = "{}"
+    if candidate.evaluation:
+        evaluation_block = json.dumps(asdict(candidate.evaluation), ensure_ascii=False)
+    prompt = (
+        f"Identitaet:\n{identity_summary}\n\n"
+        f"Auftrag:\n{brief.task}\n\n"
+        f"Zielprofil:\n{brief.target_profile}\n\n"
+        f"Kandidat:\n- Name: {candidate.name}\n- URL: {candidate.url}\n- Summary: {candidate.summary}\n"
+        f"- Notizen: {candidate.notes}\n- NorthData: {candidate.northdata_info or '—'}\n\n"
+        f"Evaluator (JSON):\n{evaluation_block}\n\n"
+        + (contacts_block + "\n\n" if contacts_block else "")
+    )
+    if context_block:
+        prompt += "Webseiten-Kontext:\n" + context_block + "\n"
+    result = await Runner.run(agent, prompt)
+
+    raw = result.final_output or ""
+    try:
+        data = json.loads(extract_json_block(raw))
+    except json.JSONDecodeError:
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+
+    profile: dict[str, object] = dict(data)
+    profile.setdefault("name", candidate.name)
+    profile.setdefault("url", candidate.url)
+    if candidate.evaluation:
+        profile.setdefault("org_type", candidate.evaluation.org_type)
+        profile.setdefault("org_size", candidate.evaluation.org_size)
+        profile.setdefault("category", candidate.evaluation.category)
+
+    email_set: set[str] = set()
+    raw_emails = profile.get("contact_emails")
+    if isinstance(raw_emails, list):
+        for email in raw_emails:
+            normalized = str(email).strip().lower()
+            if normalized:
+                email_set.add(normalized)
+    for contact in contacts:
+        normalized = contact.email.strip().lower()
+        if normalized:
+            email_set.add(normalized)
+    profile["contact_emails"] = sorted(email_set)
+    return profile
+
+
+def store_candidate_profile(candidate: CandidateInfo, profile: dict[str, object]) -> Path:
+    PROFILES_DIR.mkdir(parents=True, exist_ok=True)
+    slug = candidate.org_slug or slugify(candidate.name)
+    path = PROFILES_DIR / f"{slug}.json"
+    path.write_text(json.dumps(profile, ensure_ascii=False, indent=2), encoding="utf-8")
+    return path
 
 
 async def run_writer_agent(
     model: OpenAIChatCompletionsModel,
     identity_summary: str,
+    brief: CampaignBrief,
+    message_template: str,
     candidate: CandidateInfo,
     feedback: str = "",
     snapshot: Optional[SiteSnapshot] = None,
     context: Optional[CandidateContext] = None,
+    profile: Optional[dict[str, object]] = None,
 ) -> str:
     console(f"Writer erstellt Entwurf fuer {candidate.name} ...")
     agent = Agent(
         name="LetterWriter",
         instructions=(
-            "Du verfasst personalisierte, freundliche Einladungen fuer die Maker Faire. "
-            f"Verwende hoechstens {MAX_LETTER_WORDS} Woerter, damit der Text auf eine DIN-A4-Seite passt. "
-            "Mache keine verbindlichen Versprechen oder Garantien; bleibe bei einladender, realistischer Sprache. "
-            "Hebe die Vorteile fuer den Empfaenger hervor, betone, dass wir kleinteilige, kreative, "
-            "nicht-kommerzielle Projekte wie Chaotikum/Fuchsbau suchen und dass gemeinnuet zig/nicht-kommerzielle Teams "
-            "einen kostenfreien Stand erhalten. Wenn Feedback bereitgestellt wird, arbeite es praezise ein."
+            "Du verfasst personalisierte Erstkontakt-Nachrichten (z. B. E-Mail) passend zum Auftrag. "
+            f"Schreibe auf {brief.language} und verwende hoechstens {brief.max_message_words} Woerter. "
+            "Halte dich an die bereitgestellte Vorlage (Struktur/Abschnitte), ersetze Platzhalter sinnvoll "
+            "(wenn Informationen fehlen, lasse Platzhalter weg statt zu halluzinieren). "
+            "Mache keine verbindlichen Versprechen oder Garantien; bleibe bei realistischer Sprache. "
+            "Wenn Feedback bereitgestellt wird, arbeite es praezise ein."
         ),
         model=model,
     )
     context_block = format_context_for_prompt(context)
     if not context_block:
         context_block = format_snapshot_for_prompt(snapshot)
+    contacts_block = ""
+    contacts = candidate.contacts or (context.contacts if context else [])
+    if contacts:
+        contact_lines = "\n".join(
+            f"- {c.email} ({c.name or 'Kontakt'}, {c.context or 'Quelle unbekannt'})"
+            for c in contacts
+        )
+        contacts_block = "\nGefundene Kontakte:\n" + contact_lines
 
+    template_block = message_template.strip() if message_template else ""
     prompt = (
         f"Identitaet:\n{identity_summary}\n\n"
-        f"Gesuchtes Profil:\n{TARGET_PROFILE_DESCRIPTION}\n\n"
+        f"Auftrag:\n{brief.task}\n\n"
+        f"Zielprofil:\n{brief.target_profile}\n\n"
+        "Vorlage (Struktur beibehalten, Platzhalter ersetzen):\n"
+        f"{template_block or '(keine Vorlage gesetzt)'}\n\n"
         f"Kandidat:\nName: {candidate.name}\nURL: {candidate.url}\n"
         f"Summary: {candidate.summary}\nNotizen: {candidate.notes}\n"
         f"NorthData: {candidate.northdata_info or 'Keine Zusatzinformationen'}\n\n"
-        "Schreibe nun ein Einladungsschreiben (Markdown) mit persoenlicher Ansprache."
-        "\nBetone explizit, dass der Stand fuer gemeinnuetzige und nicht-kommerzielle Teams kostenfrei ist."
+        "Schreibe nun die Nachricht als Markdown."
     )
+    if profile:
+        prompt += (
+            "\n\nStrukturiertes Profil (JSON, als Faktenbasis nutzen):\n"
+            + json.dumps(profile, ensure_ascii=False, indent=2)
+            + "\n"
+        )
     if context_block:
         prompt += (
             "\n\nZusatzinfos aus der Webseitenanalyse:\n"
             f"{context_block}\n"
         )
+    if contacts_block:
+        prompt += contacts_block
     if feedback:
         prompt += (
             "\n\nBeruecksichtige das folgende Feedback "
@@ -1424,6 +1837,7 @@ async def run_writer_agent(
 
 async def run_qa_agent(
     model: OpenAIChatCompletionsModel,
+    brief: CampaignBrief,
     letter_content: str,
     candidate: CandidateInfo,
 ) -> QAResult:
@@ -1431,13 +1845,14 @@ async def run_qa_agent(
     instructions = (
         "Du bist ein QA-Agent fuer Anschreiben. "
         "Pruefe, ob der Text hoeﬂich, faktenbasiert und frei von Versprechen/Garantien ist. "
-        f"Der Text darf max. {MAX_LETTER_WORDS} Woerter enthalten (DIN-A4). "
+        f"Der Text darf max. {brief.max_message_words} Woerter enthalten. "
         "Gib nur JSON zurueck: "
         '{"approved": true/false, "notes": "<Begruendung>", "suggested_rewrite": "<Text oder leer>"}'
     )
     agent = Agent(name="QAAgent", instructions=instructions, model=model)
     prompt = (
-        "Pruefe dieses Anschreiben:\n\n"
+        f"Auftrag:\n{brief.task}\n\n"
+        "Pruefe diese Nachricht:\n\n"
         f"{letter_content}\n\n"
         "Kandidat:\n"
         f"Name: {candidate.name}\n"
@@ -1462,36 +1877,42 @@ async def run_qa_agent(
 async def generate_letter_with_guardrails(
     model: OpenAIChatCompletionsModel,
     identity_summary: str,
+    brief: CampaignBrief,
+    message_template: str,
     candidate: CandidateInfo,
     snapshot: Optional[SiteSnapshot] = None,
     context: Optional[CandidateContext] = None,
+    profile: Optional[dict[str, object]] = None,
 ) -> QAResult:
     feedback = ""
     for attempt in range(1, MAX_QA_RETRIES + 1):
         letter = await run_writer_agent(
             model=model,
             identity_summary=identity_summary,
+            brief=brief,
+            message_template=message_template,
             candidate=candidate,
             feedback=feedback,
             snapshot=snapshot,
             context=context,
+            profile=profile,
         )
         wc = word_count(letter)
         issues = []
-        if wc > MAX_LETTER_WORDS:
-            issues.append(f"{wc} Woerter > {MAX_LETTER_WORDS}")
-        if contains_promises(letter):
+        if wc > brief.max_message_words:
+            issues.append(f"{wc} Woerter > {brief.max_message_words}")
+        if brief.avoid_promises and contains_promises(letter):
             issues.append("Text enthaelt Versprechen oder Garantien.")
         if issues:
             feedback = (
                 "Bitte kuerze den Text (max. "
-                f"{MAX_LETTER_WORDS} Woerter) und entferne Versprechen. Gefundene Probleme: "
+                f"{brief.max_message_words} Woerter) und entferne Versprechen. Gefundene Probleme: "
                 + "; ".join(issues)
             )
             append_log("writer.retry", attempt=attempt, issues=issues)
             continue
 
-        qa_result = await run_qa_agent(model, letter, candidate)
+        qa_result = await run_qa_agent(model, brief, letter, candidate)
         append_log(
             "qa.review",
             attempt=attempt,
@@ -1517,12 +1938,16 @@ class LetterDispatcher:
         limit: int,
         model: OpenAIChatCompletionsModel,
         identity_summary: str,
+        brief: CampaignBrief,
+        message_template: str,
         blacklist: BlacklistManager,
         org_registry: OrganizationRegistry,
     ) -> None:
         self.limit = max(0, limit)
         self.model = model
         self.identity_summary = identity_summary
+        self.brief = brief
+        self.message_template = message_template
         self.blacklist = blacklist
         self.org_registry = org_registry
         self._lock = asyncio.Lock()
@@ -1533,6 +1958,9 @@ class LetterDispatcher:
 
     async def enqueue(self, candidate: CandidateInfo) -> bool:
         if self.limit == 0:
+            return False
+        if not self._preflight_ok(candidate):
+            candidate.letter_status = "skipped"
             return False
         async with self._lock:
             if self._scheduled >= self.limit:
@@ -1548,15 +1976,48 @@ class LetterDispatcher:
     async def _process_candidate(self, candidate: CandidateInfo) -> None:
         try:
             context = candidate.context
+            if context is None:
+                try:
+                    context = await asyncio.to_thread(collect_candidate_context, candidate)
+                except Exception as exc:
+                    append_log("context.error", candidate=candidate.name, url=candidate.url, error=str(exc))
+                    context = None
+                else:
+                    candidate.context = context
+                    if context and context.contacts:
+                        candidate.contacts = context.contacts
             snapshot = context.primary if context else None
             if snapshot is None:
-                snapshot = await asyncio.to_thread(fetch_site_snapshot, candidate.url)
+                try:
+                    snapshot = await asyncio.to_thread(fetch_site_snapshot, candidate.url)
+                except Exception as exc:
+                    append_log("snapshot.error", candidate=candidate.name, url=candidate.url, error=str(exc))
+                    snapshot = None
+
+            profile: Optional[dict[str, object]] = None
+            try:
+                profile = await build_candidate_profile(
+                    self.model,
+                    identity_summary=self.identity_summary,
+                    brief=self.brief,
+                    candidate=candidate,
+                    context=context,
+                )
+                profile_path = store_candidate_profile(candidate, profile)
+                candidate.profile_path = str(profile_path)
+                append_log("profile.saved", candidate=candidate.name, path=str(profile_path))
+            except Exception as exc:
+                append_log("profile.error", candidate=candidate.name, url=candidate.url, error=str(exc))
+
             qa_result = await generate_letter_with_guardrails(
                 self.model,
                 self.identity_summary,
+                self.brief,
+                self.message_template,
                 candidate,
                 snapshot=snapshot,
                 context=context,
+                profile=profile,
             )
             letter_path = store_letter(
                 candidate, qa_result.letter, qa_notes=qa_result.notes
@@ -1593,6 +2054,12 @@ class LetterDispatcher:
             async with self._lock:
                 self._failed += 1
 
+    def _preflight_ok(self, candidate: CandidateInfo) -> bool:
+        """Manuelle Checkliste: nur senden, wenn Mindestanforderungen erfüllt sind."""
+        if self.brief.require_contact_email and not candidate.contacts:
+            return False
+        return True
+
     def stats(self) -> dict[str, int]:
         return {
             "scheduled": self._scheduled,
@@ -1612,6 +2079,7 @@ async def orchestrate_search(
     model: OpenAIChatCompletionsModel,
     search_model: Optional[OpenAIResponsesModel],
     identity_summary: str,
+    brief: CampaignBrief,
     plan: PlannerPlan,
     blacklist: BlacklistManager,
     org_registry: OrganizationRegistry,
@@ -1620,13 +2088,16 @@ async def orchestrate_search(
     max_results_per_query: int,
     region: str,
     accept_threshold: float,
+    stop_signal: Optional[StopSignal] = None,
+    search_retries: int = DEFAULT_SEARCH_RETRIES,
+    search_retry_backoff: float = DEFAULT_SEARCH_RETRY_BACKOFF,
     letter_dispatcher: Optional[LetterDispatcher] = None,
 ) -> tuple[List[CandidateInfo], List[CandidateInfo], str, int]:
     accepted: List[CandidateInfo] = []
     all_candidates: List[CandidateInfo] = []
     seen_urls: set[str] = set()
     used_queries: List[str] = []
-    feedback_pool: List[str] = []
+    feedback_bus = FeedbackBus()
     seen_org_slugs: set[str] = set()
 
     backend_name, search_fn, store_fn = select_search_backend()
@@ -1643,12 +2114,17 @@ async def orchestrate_search(
     expanded_directories: set[str] = set()
 
     search_failed = False
+    candidate_concurrency = max(1, get_int_setting("PIPELINE_CANDIDATE_CONCURRENCY", 4))
+    candidate_semaphore = asyncio.Semaphore(candidate_concurrency)
+    state_lock = asyncio.Lock()
 
     async def process_candidate(candidate: CandidateInfo, depth: int = 0) -> int:
         """Evaluates a candidate and expands directory-style pages if useful."""
-        if candidate.url in seen_urls:
-            return 0
-        seen_urls.add(candidate.url)
+        context_obj: Optional[CandidateContext] = None
+        async with state_lock:
+            if candidate.url in seen_urls:
+                return 0
+            seen_urls.add(candidate.url)
 
         blacklist_entry = blacklist.is_blacklisted(candidate.url)
         if blacklist_entry:
@@ -1663,17 +2139,17 @@ async def orchestrate_search(
             return 1
 
         if not candidate_matches_region(candidate, region):
-            reason = "Außerhalb Norddeutschland (Geo-Heuristik)."
+            reason = f"Außerhalb Zielregion '{region}' (Geo-Heuristik)."
             evaluation = EvaluationResult(
                 score=0.15,
                 accepted=False,
                 reason=reason,
-                search_adjustment="Region Norddeutschland stärker einschränken",
+                search_adjustment=f"Region '{region}' stärker einschränken",
             )
             candidate.evaluation = evaluation
             candidate.notes = reason
             all_candidates.append(candidate)
-            feedback_pool.append(evaluation.search_adjustment)
+            feedback_bus.add(evaluation.search_adjustment)
             return 1
 
         org_slug, slug_reason = await resolve_candidate_slug(
@@ -1684,39 +2160,40 @@ async def orchestrate_search(
         )
         candidate.org_slug = org_slug
         candidate.duplicate_reason = slug_reason
-        existing_record = org_registry.get(org_slug)
-        if org_slug in seen_org_slugs:
-            append_log(
-                "candidate.duplicate.run_skip",
-                slug=org_slug,
+        async with state_lock:
+            existing_record = org_registry.get(org_slug)
+            if org_slug in seen_org_slugs:
+                append_log(
+                    "candidate.duplicate.run_skip",
+                    slug=org_slug,
+                    name=candidate.name,
+                    url=candidate.url,
+                    reason=slug_reason,
+                )
+                candidate.notes = slug_reason or "Bereits im aktuellen Lauf aufgenommen."
+                all_candidates.append(candidate)
+                return 1
+            if existing_record and existing_record.status in {"accepted", "contacted"}:
+                reason = slug_reason or f"Organisation bereits {existing_record.status}."
+                append_log(
+                    "candidate.duplicate.registry_skip",
+                    slug=org_slug,
+                    name=candidate.name,
+                    status=existing_record.status,
+                    reason=reason,
+                )
+                candidate.notes = reason
+                all_candidates.append(candidate)
+                return 1
+            org_registry.upsert(
+                org_slug,
                 name=candidate.name,
+                domain=domain_key(candidate.url),
                 url=candidate.url,
-                reason=slug_reason,
+                status=existing_record.status if existing_record else "seen",
+                notes=slug_reason,
             )
-            candidate.notes = slug_reason or "Bereits im aktuellen Lauf aufgenommen."
-            all_candidates.append(candidate)
-            return 1
-        if existing_record and existing_record.status in {"accepted", "contacted"}:
-            reason = slug_reason or f"Organisation bereits {existing_record.status}."
-            append_log(
-                "candidate.duplicate.registry_skip",
-                slug=org_slug,
-                name=candidate.name,
-                status=existing_record.status,
-                reason=reason,
-            )
-            candidate.notes = reason
-            all_candidates.append(candidate)
-            return 1
-        org_registry.upsert(
-            org_slug,
-            name=candidate.name,
-            domain=domain_key(candidate.url),
-            url=candidate.url,
-            status=existing_record.status if existing_record else "seen",
-            notes=slug_reason,
-        )
-        seen_org_slugs.add(org_slug)
+            seen_org_slugs.add(org_slug)
 
         is_directory = looks_like_directory_candidate(candidate)
 
@@ -1730,7 +2207,15 @@ async def orchestrate_search(
         else:
             context_obj = await asyncio.to_thread(collect_candidate_context, candidate)
             candidate.context = context_obj
-            evaluation = await evaluate_candidate(model, identity_summary, candidate, context_obj)
+            candidate.contacts = context_obj.contacts
+            evaluation = await evaluate_candidate(
+                model,
+                identity_summary,
+                brief,
+                candidate,
+                context_obj,
+                region=region,
+            )
         candidate.evaluation = evaluation
 
         coordination: Optional[CoordinatorDecision] = None
@@ -1738,6 +2223,7 @@ async def orchestrate_search(
             coordination = await coordinate_candidate(
                 model=model,
                 identity_summary=identity_summary,
+                brief=brief,
                 candidate=candidate,
                 evaluation=evaluation,
                 region=region,
@@ -1750,11 +2236,15 @@ async def orchestrate_search(
             note_parts.append(f"Koordinator: {coordination.reason}")
             if coordination.dialogue:
                 note_parts.append("Dialog: " + " | ".join(coordination.dialogue[:3]))
+        if candidate.contacts:
+            emails_preview = ", ".join(contact.email for contact in candidate.contacts[:3])
+            note_parts.append(f"Kontakt-E-Mails: {emails_preview}")
         candidate.notes = " / ".join(part for part in note_parts if part)
         all_candidates.append(candidate)
 
         if coordination and coordination.keyword_hints:
-            feedback_pool.extend(coordination.keyword_hints)
+            for hint in coordination.keyword_hints:
+                feedback_bus.add(hint)
 
         if coordination and coordination.blacklist:
             reason = coordination.blacklist_reason or coordination.reason
@@ -1792,19 +2282,32 @@ async def orchestrate_search(
                 and not coordination.blacklist
             )
 
-        if (
-            should_accept
-            and not is_directory
-            and len(accepted) < plan.target_candidates
-        ):
-            accepted.append(candidate)
+        if should_accept and brief.require_contact_email and not candidate.contacts:
+            should_accept = False
+            contact_hint = "Kontakt-E-Mail fehlt – Kontakt/Impressum stärker scrapen."
+            feedback_bus.add(contact_hint)
+            append_log(
+                "candidate.no_contact_email",
+                name=candidate.name,
+                url=candidate.url,
+                reason=contact_hint,
+            )
+            candidate.notes = (candidate.notes + " / " if candidate.notes else "") + contact_hint
+
+        accepted_now = False
+        if should_accept and not is_directory:
+            async with state_lock:
+                if len(accepted) < plan.target_candidates:
+                    accepted.append(candidate)
+                    accepted_now = True
+                    if candidate.org_slug:
+                        org_registry.mark_status(candidate.org_slug, "accepted")
+        if accepted_now:
             console(f"Kandidat akzeptiert: {candidate.name}")
-            if candidate.org_slug:
-                org_registry.mark_status(candidate.org_slug, "accepted")
             if letter_dispatcher:
                 await letter_dispatcher.enqueue(candidate)
         elif evaluation.search_adjustment:
-            feedback_pool.append(evaluation.search_adjustment)
+            feedback_bus.add(evaluation.search_adjustment)
 
         should_expand = (
             depth < DIRECTORY_MAX_DEPTH
@@ -1844,14 +2347,33 @@ async def orchestrate_search(
                             entry,
                         )
                         processed += await process_candidate(derived_candidate, depth + 1)
+
+        partner_links = context_obj.partner_links if context_obj else []
+        if partner_links and depth < DIRECTORY_MAX_DEPTH:
+            limited_links = partner_links[:PARTNER_LINK_LIMIT]
+            append_log(
+                "partner_links.found",
+                source=candidate.url,
+                count=len(limited_links),
+            )
+            for link in limited_links:
+                derived_candidate = candidate_from_partner_link(candidate, link)
+                processed += await process_candidate(derived_candidate, depth + 1)
         return processed
 
     while len(accepted) < plan.target_candidates and iteration < max_iterations and queries:
+        if stop_signal and stop_signal.triggered():
+            console("Stop-Flag erkannt – keine neuen Aufgaben, laufende Tasks werden beendet.")
+            append_log("pipeline.stop_flag", accepted=len(accepted), considered=len(all_candidates))
+            break
         iteration += 1
         console(f"--- Suchiteration {iteration} mit {len(queries)} Queries ---")
         new_candidates_in_iteration = 0
 
         for query in queries:
+            if stop_signal and stop_signal.triggered():
+                console("Stop-Flag erkannt – breche neue Suche ab, vorhandene Ergebnisse werden verwendet.")
+                break
             used_queries.append(query)
             results: List[SearchResult] = []
             backend_used = None
@@ -1875,23 +2397,32 @@ async def orchestrate_search(
                     console(f"WebSearchTool Fehler fuer '{query}': {exc}")
 
             if not results:
-                try:
-                    results = await asyncio.to_thread(
-                        search_fn,
-                        query,
-                        max_results=max_results_per_query,
-                    )
-                    backend_used = backend_name
-                    console(f"{backend_name} Suche fuer '{query}' gestartet ...")
-                except Exception as exc:
-                    append_log(
-                        "search.error",
-                        backend=backend_name,
-                        query=query,
-                        error=str(exc),
-                    )
-                    console(f"{backend_name} Suche abgebrochen (Limit/Fehler): {exc}")
-                    search_failed = True
+                attempt = 0
+                while attempt <= search_retries:
+                    try:
+                        results = await asyncio.to_thread(
+                            search_fn,
+                            query,
+                            max_results=max_results_per_query,
+                        )
+                        backend_used = backend_name
+                        console(f"{backend_name} Suche fuer '{query}' gestartet (Versuch {attempt+1}) ...")
+                        break
+                    except Exception as exc:
+                        append_log(
+                            "search.error",
+                            backend=backend_name,
+                            query=query,
+                            error=str(exc),
+                            attempt=attempt + 1,
+                        )
+                        attempt += 1
+                        if attempt > search_retries:
+                            console(f"{backend_name} Suche abgebrochen (Limit/Fehler): {exc}")
+                            search_failed = True
+                            break
+                        await asyncio.sleep(search_retry_backoff * attempt)
+                if search_failed:
                     break
 
             if not results:
@@ -1907,7 +2438,7 @@ async def orchestrate_search(
                     console(f"Cache-Treffer fuer '{query}' ({len(results)} Ergebnisse).")
 
             if results:
-                results = await filter_search_results(model, identity_summary, query, results)
+                results = await filter_search_results(model, identity_summary, brief, query, results)
                 store_fn(query, results)
                 append_log(
                     "search.results",
@@ -1928,10 +2459,32 @@ async def orchestrate_search(
             if backend_used == "duckduckgo" and DUCKDUCKGO_QUERY_DELAY > 0:
                 await asyncio.sleep(DUCKDUCKGO_QUERY_DELAY)
 
-            candidates = build_candidates_from_search(query, results)
-            for candidate in candidates:
-                processed = await process_candidate(candidate)
-                new_candidates_in_iteration += processed
+            candidates = build_candidates_from_search(query, results, brief=brief)
+            async def process_one(candidate: CandidateInfo) -> int:
+                async with candidate_semaphore:
+                    try:
+                        return await process_candidate(candidate)
+                    except Exception as exc:
+                        append_log(
+                            "candidate.error",
+                            candidate=getattr(candidate, "name", "unknown"),
+                            url=getattr(candidate, "url", ""),
+                            error=str(exc),
+                            query=query,
+                        )
+                        console(f"[WARN] Fehler bei Kandidat {getattr(candidate, 'name', 'unknown')}: {exc} (suche laeuft weiter)")
+                        return 0
+
+            tasks = [asyncio.create_task(process_one(candidate)) for candidate in candidates]
+            if tasks:
+                results_processed = await asyncio.gather(*tasks, return_exceptions=True)
+                for processed in results_processed:
+                    if isinstance(processed, Exception):
+                        continue
+                    try:
+                        new_candidates_in_iteration += int(processed)
+                    except (TypeError, ValueError):
+                        continue
 
         if len(accepted) >= plan.target_candidates:
             break
@@ -1946,16 +2499,42 @@ async def orchestrate_search(
         new_queries, direct_candidates = await refine_queries(
             model=model,
             identity_summary=identity_summary,
-            base_task="Finde nicht-kommerzielle Maker-Kollektive fuer die Maker Faire Lübeck.",
-            feedback_hints=feedback_pool[-10:],  # letzte Hinweise reichen
+            brief=brief,
+            feedback_hints=feedback_bus.recent(10),  # letzte Hinweise reichen
             used_queries=used_queries,
             missing=remaining,
             region=region,
             recent_accepts=recent_accepts,
         )
-        for direct_candidate in direct_candidates:
-            processed = await process_candidate(direct_candidate)
-            new_candidates_in_iteration += processed
+        if direct_candidates:
+            async def process_direct(candidate: CandidateInfo) -> int:
+                async with candidate_semaphore:
+                    try:
+                        return await process_candidate(candidate)
+                    except Exception as exc:
+                        append_log(
+                            "candidate.error",
+                            candidate=getattr(candidate, "name", "unknown"),
+                            url=getattr(candidate, "url", ""),
+                            error=str(exc),
+                            source="refine_direct",
+                        )
+                        console(
+                            f"[WARN] Fehler bei Direkt-Kandidat {getattr(candidate, 'name', 'unknown')}: {exc} (suche laeuft weiter)"
+                        )
+                        return 0
+
+            direct_results = await asyncio.gather(
+                *(process_direct(cand) for cand in direct_candidates),
+                return_exceptions=True,
+            )
+            for processed in direct_results:
+                if isinstance(processed, Exception):
+                    continue
+                try:
+                    new_candidates_in_iteration += int(processed)
+                except (TypeError, ValueError):
+                    continue
         queries = [q for q in iter_queries(new_queries) if q not in used_queries]
 
         if new_candidates_in_iteration == 0 and not queries:
@@ -1967,6 +2546,19 @@ async def orchestrate_search(
 
 async def async_main() -> None:
     args = parse_args()
+    settings = load_pipeline_settings()
+    if getattr(settings, "candidate_concurrency", None):
+        os.environ.setdefault("PIPELINE_CANDIDATE_CONCURRENCY", str(settings.candidate_concurrency))
+    brief_path = Path(args.brief) if args.brief else DEFAULT_BRIEF_PATH
+    brief = load_campaign_brief(brief_path)
+    message_template = load_message_template(Path(brief.message_template_path))
+    stop_file_arg = args.stop_file
+    if stop_file_arg == str(STOP_FILE_DEFAULT) and settings.stop_file:
+        stop_file_arg = settings.stop_file
+    stop_path: Optional[Path] = None
+    if stop_file_arg and str(stop_file_arg).lower() not in {"none", "false", "0"}:
+        stop_path = Path(stop_file_arg).resolve()
+    stop_signal = StopSignal(stop_path)
     presets = phase_presets(args.phase)
     ensure_dirs()
     load_env_file(ENV_PATH)
@@ -1976,22 +2568,37 @@ async def async_main() -> None:
     identity_summary = get_identity_summary(identity)
 
     chat_model, search_model = build_models()
-    max_iterations = args.max_iterations
-    if max_iterations is None:
-        max_iterations = get_int_setting("PIPELINE_MAX_ITERATIONS", presets["max_iterations"])
+    max_iterations = (
+        args.max_iterations
+        if args.max_iterations is not None
+        else get_int_setting("PIPELINE_MAX_ITERATIONS", settings.max_iterations or presets["max_iterations"])
+    )
     max_iterations = max(3, int(max_iterations))
 
-    max_results_per_query = args.results_per_query
-    if max_results_per_query is None:
-        max_results_per_query = get_int_setting(
-            "PIPELINE_RESULTS_PER_QUERY", presets["results_per_query"]
-        )
+    max_results_per_query = (
+        args.results_per_query
+        if args.results_per_query is not None
+        else get_int_setting("PIPELINE_RESULTS_PER_QUERY", settings.results_per_query or presets["results_per_query"])
+    )
     max_results_per_query = max(3, int(max_results_per_query))
 
-    requested_letters = args.letters_per_run
-    if requested_letters is None:
-        requested_letters = get_int_setting("MAX_LETTERS_PER_RUN", DEFAULT_MAX_LETTERS)
+    requested_letters = (
+        args.letters_per_run
+        if args.letters_per_run is not None
+        else get_int_setting("MAX_LETTERS_PER_RUN", settings.letters_per_run)
+    )
     requested_letters = max(0, int(requested_letters))
+
+    search_retries = (
+        args.search_retries
+        if args.search_retries is not None
+        else settings.search_retries or DEFAULT_SEARCH_RETRIES
+    )
+    search_retry_backoff = (
+        args.search_retry_backoff
+        if args.search_retry_backoff is not None
+        else settings.search_retry_backoff or DEFAULT_SEARCH_RETRY_BACKOFF
+    )
     target_override = args.target_candidates
     if target_override is not None:
         try:
@@ -2002,17 +2609,28 @@ async def async_main() -> None:
         f"Phase: {args.phase} | Region: {args.region} | Iterationen: {max_iterations} | Treffer/Query: {max_results_per_query} | Briefe-Wunsch: {requested_letters}"
     )
 
-    task = (
-        "Finde mindestens 50 nicht-kommerzielle Maker:innen, Vereine oder Kollektive "
-        "aus Norddeutschland (z. B. Chaotikum, Fuchsbau, offene Werkstätten), "
-        "die zur Maker Faire Lübeck 2026 passen."
+    append_log(
+        "pipeline.start",
+        task=brief.task,
+        brief_path=str(brief_path),
+        template_path=brief.message_template_path,
+        commercial_mode=brief.commercial_mode,
     )
-    append_log("pipeline.start", task=task)
-    plan, planner_raw = await run_planner(chat_model, task, identity_summary)
-    extend_plan_with_region(plan, args.region)
-    plan.search_queries = enforce_focus_keywords(plan.search_queries)
+    plan, planner_raw = await run_planner(
+        chat_model,
+        brief=brief,
+        identity_summary=identity_summary,
+        region=args.region,
+    )
+    extend_plan_with_region(plan, args.region, brief)
+    plan.search_queries = enforce_focus_keywords(plan.search_queries, brief)
     if target_override is None:
-        target_override = requested_letters or plan.target_candidates or DEFAULT_TARGET_CANDIDATES
+        target_override = (
+            requested_letters
+            or plan.target_candidates
+            or settings.target_candidates
+            or DEFAULT_TARGET_CANDIDATES
+        )
     final_target = max(1, int(target_override))
     if requested_letters:
         final_target = max(final_target, requested_letters)
@@ -2050,6 +2668,8 @@ async def async_main() -> None:
         limit=plan.target_candidates,
         model=chat_model,
         identity_summary=identity_summary,
+        brief=brief,
+        message_template=message_template,
         blacklist=blacklist,
         org_registry=org_registry,
     )
@@ -2091,6 +2711,7 @@ async def async_main() -> None:
             chat_model,
             search_model,
             identity_summary,
+            brief,
             plan,
             blacklist,
             org_registry,
@@ -2098,6 +2719,9 @@ async def async_main() -> None:
             max_results_per_query=max_results_per_query,
             region=args.region,
             accept_threshold=accept_threshold,
+            stop_signal=stop_signal,
+            search_retries=search_retries,
+            search_retry_backoff=search_retry_backoff,
             letter_dispatcher=letter_dispatcher,
         )
     if not accepted:
@@ -2154,6 +2778,24 @@ async def async_main() -> None:
         letter_stats=letter_stats,
     )
     summarize_run(plan, accepted, all_candidates, letter_stats)
+
+    contacts_export = export_contacts(accepted)
+    if contacts_export:
+        console(f"Kontakt-Export gespeichert: {contacts_export}")
+        append_log("contacts.export", path=str(contacts_export))
+    store_last_run_summary(
+        brief_path=brief_path,
+        brief=brief,
+        phase=args.phase,
+        region=args.region,
+        plan=plan,
+        accepted=accepted,
+        all_candidates=all_candidates,
+        backend=backend_name,
+        empty_searches=empty_searches,
+        letter_stats=letter_stats,
+        contacts_export=contacts_export,
+    )
 
     persisted = blacklist.persist()
     if persisted:
